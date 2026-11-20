@@ -160,3 +160,265 @@ class TriageResult:
                 record.sessionid for record in self.candidate_records
             ],
         }
+
+
+class DictSerializable:
+    def to_dict(self) -> Dict[str, Any]:
+        return _serialize_dataclass(self)
+
+
+def _serialize_dataclass(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.value
+    if hasattr(value, "__dataclass_fields__"):
+        return {
+            name: _serialize_dataclass(getattr(value, name))
+            for name in value.__dataclass_fields__
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _serialize_dataclass(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_serialize_dataclass(item) for item in value]
+    return value
+
+
+class BatchRunDecision(str, Enum):
+    RUN_BASELINE = "RUN_BASELINE"
+    SKIP_NO_BATCH_VALUE = "SKIP_NO_BATCH_VALUE"
+    STOP_BLOCKED = "STOP_BLOCKED"
+    STOP_UNSOLVABLE = "STOP_UNSOLVABLE"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+
+
+class RecoveryValueDecision(str, Enum):
+    START_RECOVERY = "START_RECOVERY"
+    NO_REPAIR_NEEDED = "NO_REPAIR_NEEDED"
+    STOP_BLOCKED = "STOP_BLOCKED"
+    STOP_UNSOLVABLE = "STOP_UNSOLVABLE"
+    STOP_RETRYABLE = "STOP_RETRYABLE"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+
+
+class AttemptStatus(str, Enum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+    UNCERTAIN = "uncertain"
+    DEVICE_ERROR = "device_error"
+    RUNNER_ERROR = "runner_error"
+    TIMEOUT_UNKNOWN = "timeout_unknown"
+    NOT_DISPATCHED = "not_dispatched"
+    CANCELLED = "cancelled"
+
+
+class RecoveryState(str, Enum):
+    TRIAGED = "TRIAGED"
+    BATCH_VALUE_CHECKED = "BATCH_VALUE_CHECKED"
+    BASELINE_PENDING = "BASELINE_PENDING"
+    BASELINE_ANALYZED = "BASELINE_ANALYZED"
+    RECOVERY_VALUE_CHECKED = "RECOVERY_VALUE_CHECKED"
+    EXPERIENCE_EXPLORING = "EXPERIENCE_EXPLORING"
+    VALIDATING = "VALIDATING"
+    SUCCEEDED = "SUCCEEDED"
+    STOP_BLOCKED = "STOP_BLOCKED"
+    STOP_UNSOLVABLE = "STOP_UNSOLVABLE"
+    STOP_RETRYABLE = "STOP_RETRYABLE"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+
+
+@dataclass(frozen=True)
+class EvidenceRef(DictSerializable):
+    sessionid: str
+    step_ids: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class BatchRunConstraints(DictSerializable):
+    execution_authorized: bool = True
+    safety_cleared: bool = True
+    environment_ready: bool = True
+    has_reusable_baseline: bool = False
+    max_attempts: Optional[int] = None
+    notes: str = ""
+
+
+@dataclass
+class BatchRunValueAssessment(DictSerializable):
+    intent_id: str
+    intent_key: IntentKey
+    decision: BatchRunDecision
+    reason: str
+    information_value: str
+    repair_potential: str
+    confidence: float
+    evidence_refs: List[EvidenceRef]
+    candidate_count: int
+    unique_instruction_count: int
+    planned_attempt_count: int
+    source_fingerprint: str
+    blocker_type: str = ""
+    llm_decision: Optional[BatchRunDecision] = None
+    assessment_mode: str = "LLM_WITH_RULE_GUARDS"
+    rule_findings: List[str] = field(default_factory=list)
+    prompt_version: str = "batch_value_v1"
+    created_at: str = ""
+
+
+@dataclass(frozen=True)
+class BaselineSample(DictSerializable):
+    instruction_id: str
+    instruction: str
+    source_session_ids: List[str]
+    source_content_hashes: Dict[str, str]
+    attempt_indices: List[int]
+
+
+@dataclass(frozen=True)
+class BaselinePlan(DictSerializable):
+    plan_id: str
+    intent_id: str
+    intent_key: IntentKey
+    status: str
+    instruction_sample_size: int
+    attempts_per_instruction: int
+    random_seed: int
+    source_candidate_count: int
+    source_fingerprint: str
+    samples: List[BaselineSample]
+    created_at: str
+
+    @property
+    def total_attempts(self) -> int:
+        return sum(len(sample.attempt_indices) for sample in self.samples)
+
+    def to_attempt_requests(self) -> List["AttemptRequest"]:
+        requests = []
+        for sample in self.samples:
+            for attempt_index in sample.attempt_indices:
+                idempotency_key = content_hash({
+                    "plan_id": self.plan_id,
+                    "instruction_id": sample.instruction_id,
+                    "attempt_index": attempt_index,
+                })
+                requests.append(AttemptRequest(
+                    intent_id=self.intent_id,
+                    plan_id=self.plan_id,
+                    instruction_id=sample.instruction_id,
+                    instruction=sample.instruction,
+                    attempt_index=attempt_index,
+                    idempotency_key=idempotency_key,
+                ))
+        return requests
+
+
+@dataclass(frozen=True)
+class ExperienceDraft(DictSerializable):
+    experience_id: str
+    intent_id: str
+    version: int
+    hypothesis: str
+    applicable_scope: str
+    trigger_conditions: List[str]
+    strategy: str
+    expected_stage: str
+    evidence_refs: List[EvidenceRef]
+    parent_experience_id: Optional[str] = None
+    forbidden_behaviors: List[str] = field(default_factory=list)
+    exit_conditions: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AttemptRequest(DictSerializable):
+    intent_id: str
+    plan_id: str
+    instruction_id: str
+    instruction: str
+    attempt_index: int
+    idempotency_key: str
+    experience: Optional[ExperienceDraft] = None
+    environment: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AttemptResult(DictSerializable):
+    request: AttemptRequest
+    status: AttemptStatus
+    task_completed: Optional[bool]
+    trajectory: Dict[str, Any] = field(default_factory=dict)
+    environment: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class StageProgress(DictSerializable):
+    stage_name: str
+    stage_order: int
+    evidence_steps: List[str]
+    furthest_anchor: Optional[str] = None
+    first_deviation_step: Optional[str] = None
+
+    def __post_init__(self):
+        if isinstance(self.stage_order, bool) or not isinstance(self.stage_order, int):
+            raise ValueError("stage_order 必须是整数")
+        if self.stage_order < 0:
+            raise ValueError("stage_order 不能小于 0")
+
+
+@dataclass(frozen=True)
+class FailurePattern(DictSerializable):
+    pattern_id: str
+    name: str
+    description: str
+    evidence_refs: List[EvidenceRef]
+    blocker_type: str = ""
+
+
+@dataclass
+class DiagnosisReport(DictSerializable):
+    intent_id: str
+    baseline_plan_id: str
+    attempt_results: List[AttemptResult]
+    progress_by_attempt: Dict[str, StageProgress]
+    failure_patterns: List[FailurePattern]
+    summary: str
+    evidence_quality: str = "UNKNOWN"
+
+
+@dataclass
+class RecoveryValueAssessment(DictSerializable):
+    intent_id: str
+    baseline_plan_id: str
+    decision: RecoveryValueDecision
+    reason: str
+    evidence_refs: List[EvidenceRef]
+    initial_experience: Optional[ExperienceDraft] = None
+
+
+@dataclass(frozen=True)
+class ExperimentCard(DictSerializable):
+    experiment_id: str
+    intent_id: str
+    hypothesis: str
+    baseline_plan_id: str
+    experience: ExperienceDraft
+    instruction_ids: List[str]
+    attempts_per_instruction: int
+    expected_stage: str
+    falsification_criteria: List[str]
+    control_description: str = "无经验基线"
+    environment: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RecoveryStateSnapshot(DictSerializable):
+    intent_id: str
+    state: RecoveryState
+    current_experience_id: Optional[str] = None
+    current_hypothesis: str = ""
+    round_index: int = 0
+    budget: Dict[str, Any] = field(default_factory=dict)
+    history: List[Dict[str, Any]] = field(default_factory=list)

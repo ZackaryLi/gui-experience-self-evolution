@@ -1,9 +1,20 @@
-import asyncio
-import random
-from json_repair import repair_json
+from __future__ import annotations
 
-import requests, os, re, json, aiohttp
+import asyncio
+import json
+import random
+import re
 import typing as t
+
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
+try:
+    from json_repair import repair_json
+except ImportError:
+    repair_json = None
 
 API_TOKEN = ""
 MLOPS_MODEL = ""
@@ -79,14 +90,15 @@ def extract_json(text: str, default: t.Any = None) -> t.Union[t.Dict[str, t.Any]
     # ==========================================
     # 策略 5：终极兜底 - 使用 json-repair（如果已安装）
     # ==========================================
-    for candidate in candidate_texts:
-        try:
-            repaired = repair_json(candidate, return_objects=True)
-            if repaired:
-                print(f"[WARN] 标准解析失败，已通过 `json-repair` 自动修复并成功解析残缺的 JSON。")
-                return repaired
-        except Exception:
-            continue
+    if repair_json is not None:
+        for candidate in candidate_texts:
+            try:
+                repaired = repair_json(candidate, return_objects=True)
+                if repaired:
+                    print(f"[WARN] 标准解析失败，已通过 `json-repair` 自动修复并成功解析残缺的 JSON。")
+                    return repaired
+            except Exception:
+                continue
 
     # 所有策略均失败
     print(f"[ERROR] JSON 解析彻底失败！原文片段: {text[:100]}...")
@@ -102,6 +114,8 @@ class LLMAgent:
             max_concurrent: int = 6,  # 默认最大并发量限制为 10
             max_retries: int = 3  # 默认最大重试 3 次
     ):
+        if aiohttp is None:
+            raise ImportError("使用 LLMAgent 需要安装 aiohttp")
         if not api_token or not api_url:
             raise ValueError("必须提供有效的 api_token 和 api_url")
 
