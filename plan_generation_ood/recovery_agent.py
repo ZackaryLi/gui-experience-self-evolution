@@ -13,9 +13,9 @@ from .recovery_schemas import (
     RecoveryContext,
     RecoveryDecision,
     ToolCall,
-    ToolObservation,
 )
 from .schemas import EvidenceRef
+from .tools import ToolRegistry, build_default_tool_registry
 
 
 class OODRecoveryAgent:
@@ -25,6 +25,7 @@ class OODRecoveryAgent:
         llm_agent: LLMAgent,
         config: OODRecoveryAgentConfig | None = None,
         close_llm: bool = True,
+        tool_registry: Optional[ToolRegistry] = None,
     ):
         if not context.intent_id.strip():
             raise ValueError("RecoveryContext.intent_id 不能为空")
@@ -32,6 +33,7 @@ class OODRecoveryAgent:
         self.llm = llm_agent
         self.config = config or OODRecoveryAgentConfig()
         self.close_llm = close_llm
+        self.tool_registry = tool_registry or build_default_tool_registry(context)
         self._allowed_evidence = self._index_evidence(context.evidence_refs)
 
     def run(self) -> AgentRunResult:
@@ -52,7 +54,11 @@ class OODRecoveryAgent:
         invalid_responses = 0
 
         while True:
-            prompt = build_recovery_prompt(self.context, transcript)
+            prompt = build_recovery_prompt(
+                self.context,
+                transcript,
+                self.tool_registry,
+            )
             raw_response = ""
             call_error = ""
             try:
@@ -153,7 +159,10 @@ class OODRecoveryAgent:
                     invalid_responses=invalid_responses,
                 )
 
-            observation = self._get_recovery_context(action.tool_call)
+            observation = await self.tool_registry.dispatch(
+                action.tool_call.tool,
+                action.tool_call.input,
+            )
             tool_rounds += 1
             steps.append(AgentStep(
                 step_id=step_id,
@@ -184,13 +193,13 @@ class OODRecoveryAgent:
             if "decision" in payload:
                 raise ValueError("call_tool 不能包含 decision")
             tool_name = payload.get("tool")
-            if tool_name != "get_recovery_context":
-                raise ValueError(f"未知或当前阶段不可用的工具: {tool_name}")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                raise ValueError("tool 必须是非空字符串")
+            tool_name = tool_name.strip()
             tool_input = payload.get("input")
-            if not isinstance(tool_input, dict) or set(tool_input) != {"intent_id"}:
-                raise ValueError("get_recovery_context.input 只能包含 intent_id")
-            if tool_input["intent_id"] != self.context.intent_id:
-                raise ValueError("get_recovery_context 只能读取当前 intent_id")
+            if not isinstance(tool_input, dict):
+                raise ValueError("input 必须是对象")
+            self.tool_registry.validate(tool_name, tool_input)
             return AgentAction(
                 action=action_type,
                 reason=reason.strip(),
@@ -228,15 +237,6 @@ class OODRecoveryAgent:
                 raise ValueError(f"引用了不存在的证据步骤: {sorted(unknown_steps)}")
             refs.append(EvidenceRef(sessionid=sessionid, step_ids=list(step_ids)))
         return refs
-
-    def _get_recovery_context(self, tool_call: Optional[ToolCall]) -> ToolObservation:
-        if tool_call is None:
-            raise ValueError("call_tool 缺少 tool_call")
-        return ToolObservation(
-            tool=tool_call.tool,
-            success=True,
-            data={"context": self.context.to_dict()},
-        )
 
     @staticmethod
     def _index_evidence(evidence_refs: List[EvidenceRef]) -> Dict[str, set]:

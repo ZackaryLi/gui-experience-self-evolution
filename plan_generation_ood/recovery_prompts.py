@@ -2,14 +2,16 @@ import json
 from typing import Any, Dict, List
 
 from .recovery_schemas import RecoveryContext, RecoveryDecision
+from .tools import ToolRegistry
 
 
-RECOVERY_PROMPT_VERSION = "recovery_agent_s01_v1"
+RECOVERY_PROMPT_VERSION = "recovery_agent_s02_v1"
 
 
 def build_recovery_prompt(
     context: RecoveryContext,
     transcript: List[Dict[str, Any]],
+    tool_registry: ToolRegistry,
 ) -> str:
     context_preview = {
         "intent_id": context.intent_id,
@@ -24,22 +26,27 @@ def build_recovery_prompt(
         "available_evidence_refs": [ref.to_dict() for ref in context.evidence_refs],
     }
     decisions = " | ".join(decision.value for decision in RecoveryDecision)
-    return f"""你是 OOD Recovery Agent 的最小决策内核。你只能提出结构化动作，不能直接修改实验事实、Recovery 状态、预算或任务完成结论。
+    tool_descriptions = json.dumps(
+        tool_registry.describe(),
+        ensure_ascii=False,
+        indent=2,
+    )
+    return f"""你是 OOD Recovery Agent 的决策内核。你只能提出结构化动作，不能直接修改实验事实、Recovery 状态、预算或任务完成结论。
 
 当前上下文摘要：
 {json.dumps(context_preview, ensure_ascii=False, indent=2)}
 
-本阶段只允许一个只读工具：
-- get_recovery_context：输入 {{"intent_id": "当前意图ID"}}，返回当前意图的完整结构化上下文。不能查询其他意图。
+当前注册的工具及其输入 Schema：
+{tool_descriptions}
 
 每次只输出一个 JSON 对象，不要使用 Markdown。
 
-需要读取上下文时：
+需要调用工具时：
 {{
   "action": "call_tool",
-  "tool": "get_recovery_context",
-  "input": {{"intent_id": "{context.intent_id}"}},
-  "reason": "为什么需要读取",
+  "tool": "从当前注册工具中选择的名称",
+  "input": {{"参数": "必须符合所选工具的 input_schema"}},
+  "reason": "为什么需要调用",
   "evidence_refs": []
 }}
 
@@ -53,10 +60,11 @@ def build_recovery_prompt(
 
 约束：
 1. call_tool 和 finish 只能二选一，不能同时输出。
-2. 只能引用 available_evidence_refs 或工具结果中已有的证据；没有证据时 evidence_refs 为空数组。
-3. ACCEPT_EXPERIENCE 只是请求后续验证，不代表任务成功。
-4. 不生成经验正文，不提交真机实验，不把 uncertain 当作确定失败。
-5. 工具或校验错误会作为下一条记录返回，请根据错误修正动作。
+2. 只能使用上方列出的工具，input 必须严格符合对应 Schema；不要调用未注册能力。
+3. 只能引用 available_evidence_refs 或工具结果中已有的证据；没有证据时 evidence_refs 为空数组。
+4. ACCEPT_EXPERIENCE 只是请求后续验证，不代表任务成功。
+5. 不生成经验正文，不提交真机实验，不把 uncertain 当作确定失败。
+6. 工具或校验错误会作为下一条记录返回，请根据错误修正动作。
 
 已有动作和工具结果：
 {json.dumps(transcript, ensure_ascii=False, indent=2, default=str)}

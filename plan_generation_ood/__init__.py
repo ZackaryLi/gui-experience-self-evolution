@@ -22,6 +22,12 @@ from .recovery_schemas import (
     ToolObservation,
 )
 from .runner import DeviceRunner
+from .tools import (
+    ToolDefinition,
+    ToolRegistry,
+    ToolValidationError,
+    build_default_tool_registry,
+)
 from .schemas import (
     AttemptRequest,
     AttemptResult,
@@ -85,6 +91,10 @@ __all__ = [
     "RecoveryValueDecision",
     "StageProgress",
     "ToolCall",
+    "ToolDefinition",
     "ToolObservation",
+    "ToolRegistry",
+    "ToolValidationError",
     "TriageStatus",
+    "build_default_tool_registry",
 ]
