@@ -33,6 +33,14 @@ class AgentRunStatus(str, Enum):
     FINISHED = "FINISHED"
     MAX_TOOL_ROUNDS_EXCEEDED = "MAX_TOOL_ROUNDS_EXCEEDED"
     INVALID_MODEL_OUTPUT = "INVALID_MODEL_OUTPUT"
+    PERMISSION_DENIED = "PERMISSION_DENIED"
+    MANUAL_REVIEW_REQUIRED = "MANUAL_REVIEW_REQUIRED"
+
+
+class PermissionOutcome(str, Enum):
+    ALLOW = "ALLOW"
+    DENY = "DENY"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
 
 
 @dataclass(frozen=True)
@@ -52,6 +60,16 @@ class RecoveryContext(DictSerializable):
 class ToolCall(DictSerializable):
     tool: str
     input: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PermissionDecision(DictSerializable):
+    outcome: PermissionOutcome
+    reason_code: str
+    reason: str
+    tool: str
+    intent_id: str
+    details: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -78,6 +96,7 @@ class AgentStep(DictSerializable):
     action: Optional[AgentAction] = None
     observation: Optional[ToolObservation] = None
     validation_error: Optional[str] = None
+    permission: Optional[PermissionDecision] = None
 
 
 @dataclass

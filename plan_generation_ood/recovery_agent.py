@@ -1,39 +1,53 @@
 import asyncio
-from typing import Any, Dict, List, Optional
+import json
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .config import OODRecoveryAgentConfig
-from .llm import LLMAgent, extract_json
-from .recovery_prompts import build_recovery_prompt
+from .llm import extract_json
+from .recovery_prompts import build_initial_messages
 from .recovery_schemas import (
     AgentAction,
     AgentActionType,
     AgentRunResult,
     AgentRunStatus,
     AgentStep,
+    PermissionDecision,
+    PermissionOutcome,
     RecoveryContext,
     RecoveryDecision,
     ToolCall,
+    ToolObservation,
 )
+from .safety import DefaultPermissionPolicy, PermissionPolicy
 from .schemas import EvidenceRef
 from .tools import ToolRegistry, build_default_tool_registry
+
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI
 
 
 class OODRecoveryAgent:
     def __init__(
         self,
         context: RecoveryContext,
-        llm_agent: LLMAgent,
+        llm_agent: "AsyncOpenAI",
+        model: str,
         config: OODRecoveryAgentConfig | None = None,
         close_llm: bool = True,
         tool_registry: Optional[ToolRegistry] = None,
+        permission_policy: Optional[PermissionPolicy] = None,
     ):
         if not context.intent_id.strip():
             raise ValueError("RecoveryContext.intent_id 不能为空")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model 必须是非空字符串")
         self.context = context
         self.llm = llm_agent
+        self.model = model.strip()
         self.config = config or OODRecoveryAgentConfig()
         self.close_llm = close_llm
         self.tool_registry = tool_registry or build_default_tool_registry(context)
+        self.permission_policy = permission_policy or DefaultPermissionPolicy()
         self._allowed_evidence = self._index_evidence(context.evidence_refs)
 
     def run(self) -> AgentRunResult:
@@ -47,27 +61,39 @@ class OODRecoveryAgent:
                 await self.llm.close()
 
     async def _run(self) -> AgentRunResult:
-        transcript: List[Dict[str, Any]] = []
+        messages = build_initial_messages(self.context)
         steps: List[AgentStep] = []
         llm_calls = 0
         tool_rounds = 0
         invalid_responses = 0
 
         while True:
-            prompt = build_recovery_prompt(
-                self.context,
-                transcript,
-                self.tool_registry,
-            )
             raw_response = ""
             call_error = ""
+            response_message: Optional[Dict[str, Any]] = None
             try:
-                response = await self.llm.ainvoke(prompt, temperature=0.1)
-                if isinstance(response, tuple):
-                    response = response[0]
-                if not isinstance(response, str):
-                    raise ValueError("LLM 响应不是字符串")
-                raw_response = response
+                completion = await self.llm.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=self.tool_registry.to_openai_tools(),
+                    tool_choice="auto",
+                    temperature=0.1,
+                )
+                message = completion.choices[0].message
+                if hasattr(message, "model_dump"):
+                    response = message.model_dump(exclude_none=True)
+                elif isinstance(message, dict):
+                    response = message
+                else:
+                    raise ValueError("LLM 响应不是 OpenAI assistant message 对象")
+                if response.get("role", "assistant") != "assistant":
+                    raise ValueError("LLM 响应的 role 必须是 assistant")
+                response_message = response
+                raw_response = json.dumps(
+                    response,
+                    ensure_ascii=False,
+                    default=str,
+                )
             except Exception as error:
                 call_error = f"LLM_CALL_FAILED: {error}"
 
@@ -80,10 +106,10 @@ class OODRecoveryAgent:
                     raw_response=raw_response,
                     validation_error=call_error,
                 ))
-                transcript.extend([
-                    {"type": "assistant", "content": raw_response},
-                    {"type": "validation_error", "content": call_error},
-                ])
+                messages.append({
+                    "role": "user",
+                    "content": f"上一轮调用失败，请修正：{call_error}",
+                })
                 if invalid_responses >= self.config.max_invalid_responses:
                     return AgentRunResult(
                         status=AgentRunStatus.INVALID_MODEL_OUTPUT,
@@ -96,31 +122,75 @@ class OODRecoveryAgent:
                     )
                 continue
 
-            try:
-                action = self._parse_action(extract_json(raw_response, default={}))
-            except Exception as error:
-                validation_error = str(error)
-                invalid_responses += 1
-                steps.append(AgentStep(
-                    step_id=step_id,
-                    raw_response=raw_response,
-                    validation_error=validation_error,
-                ))
-                transcript.extend([
-                    {"type": "assistant", "content": raw_response},
-                    {"type": "validation_error", "content": validation_error},
-                ])
-                if invalid_responses >= self.config.max_invalid_responses:
-                    return AgentRunResult(
-                        status=AgentRunStatus.INVALID_MODEL_OUTPUT,
-                        reason=validation_error,
-                        decision=None,
-                        steps=steps,
-                        llm_calls=llm_calls,
-                        tool_rounds=tool_rounds,
-                        invalid_responses=invalid_responses,
-                    )
-                continue
+            tool_calls = response_message.get("tool_calls") or []
+            if tool_calls:
+                call_id = None
+                assistant_appended = False
+                try:
+                    call_id, tool_call = self._parse_native_tool_call(tool_calls)
+                    messages.append(self._assistant_message(response_message))
+                    assistant_appended = True
+                    action = self._action_from_tool_call(tool_call)
+                except Exception as error:
+                    validation_error = str(error)
+                    invalid_responses += 1
+                    steps.append(AgentStep(
+                        step_id=step_id,
+                        raw_response=raw_response,
+                        validation_error=validation_error,
+                    ))
+                    if assistant_appended and call_id:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": json.dumps({
+                                "success": False,
+                                "error": validation_error,
+                            }, ensure_ascii=False),
+                        })
+                    else:
+                        messages.append({
+                            "role": "user",
+                            "content": f"上一轮工具调用格式无效，请修正：{validation_error}",
+                        })
+                    if invalid_responses >= self.config.max_invalid_responses:
+                        return AgentRunResult(
+                            status=AgentRunStatus.INVALID_MODEL_OUTPUT,
+                            reason=validation_error,
+                            decision=None,
+                            steps=steps,
+                            llm_calls=llm_calls,
+                            tool_rounds=tool_rounds,
+                            invalid_responses=invalid_responses,
+                        )
+                    continue
+            else:
+                messages.append(self._assistant_message(response_message))
+                try:
+                    action = self._parse_finish(response_message.get("content"))
+                except Exception as error:
+                    validation_error = str(error)
+                    invalid_responses += 1
+                    steps.append(AgentStep(
+                        step_id=step_id,
+                        raw_response=raw_response,
+                        validation_error=validation_error,
+                    ))
+                    messages.append({
+                        "role": "user",
+                        "content": f"上一轮最终决策格式无效，请修正：{validation_error}",
+                    })
+                    if invalid_responses >= self.config.max_invalid_responses:
+                        return AgentRunResult(
+                            status=AgentRunStatus.INVALID_MODEL_OUTPUT,
+                            reason=validation_error,
+                            decision=None,
+                            steps=steps,
+                            llm_calls=llm_calls,
+                            tool_rounds=tool_rounds,
+                            invalid_responses=invalid_responses,
+                        )
+                    continue
 
             if action.action is AgentActionType.FINISH:
                 steps.append(AgentStep(
@@ -159,6 +229,45 @@ class OODRecoveryAgent:
                     invalid_responses=invalid_responses,
                 )
 
+            permission = self._evaluate_permission(action.tool_call)
+            if permission.outcome is not PermissionOutcome.ALLOW:
+                observation = ToolObservation(
+                    tool=action.tool_call.tool,
+                    success=False,
+                    data={"permission": permission.to_dict()},
+                    error=f"{permission.reason_code}: {permission.reason}",
+                )
+                steps.append(AgentStep(
+                    step_id=step_id,
+                    raw_response=raw_response,
+                    action=action,
+                    observation=observation,
+                    permission=permission,
+                ))
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(
+                        observation.to_dict(),
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                })
+                run_status = (
+                    AgentRunStatus.PERMISSION_DENIED
+                    if permission.outcome is PermissionOutcome.DENY
+                    else AgentRunStatus.MANUAL_REVIEW_REQUIRED
+                )
+                return AgentRunResult(
+                    status=run_status,
+                    reason=permission.reason,
+                    decision=None,
+                    steps=steps,
+                    llm_calls=llm_calls,
+                    tool_rounds=tool_rounds,
+                    invalid_responses=invalid_responses,
+                )
+
             observation = await self.tool_registry.dispatch(
                 action.tool_call.tool,
                 action.tool_call.input,
@@ -169,51 +278,96 @@ class OODRecoveryAgent:
                 raw_response=raw_response,
                 action=action,
                 observation=observation,
+                permission=permission,
             ))
-            transcript.extend([
-                {"type": "assistant", "content": raw_response},
-                {"type": "tool_result", "content": observation.to_dict()},
-            ])
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": json.dumps(
+                    observation.to_dict(),
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            })
 
-    def _parse_action(self, payload: Any) -> AgentAction:
+    def _evaluate_permission(self, tool_call: ToolCall) -> PermissionDecision:
+        definition = self.tool_registry.get(tool_call.tool)
+        try:
+            return self.permission_policy.evaluate(
+                self.context,
+                definition,
+                tool_call,
+            )
+        except Exception as error:
+            return PermissionDecision(
+                outcome=PermissionOutcome.MANUAL_REVIEW,
+                reason_code="PERMISSION_POLICY_ERROR",
+                reason="权限策略执行失败，已按失败关闭原则停止工具调用。",
+                tool=tool_call.tool,
+                intent_id=self.context.intent_id,
+                details={"error_type": type(error).__name__},
+            )
+
+    @staticmethod
+    def _assistant_message(response_message: Dict[str, Any]) -> Dict[str, Any]:
+        message = dict(response_message)
+        message["role"] = "assistant"
+        return message
+
+    @staticmethod
+    def _parse_native_tool_call(tool_calls: Any) -> Tuple[str, ToolCall]:
+        if not isinstance(tool_calls, list) or len(tool_calls) != 1:
+            raise ValueError("每轮必须且只能包含一个原生 tool_call")
+        call = tool_calls[0]
+        if not isinstance(call, dict) or call.get("type") != "function":
+            raise ValueError("tool_call 必须是 function 类型")
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise ValueError("tool_call.id 必须是非空字符串")
+        function = call.get("function")
+        if not isinstance(function, dict):
+            raise ValueError("tool_call.function 必须是对象")
+        name = function.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("tool_call.function.name 必须是非空字符串")
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            raise ValueError("tool_call.function.arguments 必须是 JSON 字符串")
+        try:
+            tool_input = json.loads(arguments)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"工具参数不是合法 JSON: {error}") from error
+        if not isinstance(tool_input, dict):
+            raise ValueError("工具参数 JSON 必须是对象")
+        return call_id, ToolCall(tool=name.strip(), input=tool_input)
+
+    def _action_from_tool_call(self, tool_call: ToolCall) -> AgentAction:
+        self.tool_registry.validate(tool_call.tool, tool_call.input)
+        return AgentAction(
+            action=AgentActionType.CALL_TOOL,
+            reason=f"调用原生工具 {tool_call.tool}",
+            evidence_refs=[],
+            tool_call=tool_call,
+        )
+
+    def _parse_finish(self, content: Any) -> AgentAction:
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("最终决策必须是 assistant content 中的非空 JSON")
+        payload = extract_json(content, default={})
         if not isinstance(payload, dict):
-            raise ValueError("Agent 输出必须是 JSON 对象")
-        allowed_fields = {"action", "tool", "input", "decision", "reason", "evidence_refs"}
+            raise ValueError("最终决策必须是 JSON 对象")
+        allowed_fields = {"decision", "reason", "evidence_refs"}
         unknown_fields = set(payload) - allowed_fields
         if unknown_fields:
-            raise ValueError(f"Agent 输出包含未知字段: {sorted(unknown_fields)}")
-
-        action_type = AgentActionType(str(payload.get("action", "")))
+            raise ValueError(f"最终决策包含未知字段: {sorted(unknown_fields)}")
         reason = payload.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason 必须是非空字符串")
-        evidence_refs = self._parse_evidence_refs(payload.get("evidence_refs"))
-
-        if action_type is AgentActionType.CALL_TOOL:
-            if "decision" in payload:
-                raise ValueError("call_tool 不能包含 decision")
-            tool_name = payload.get("tool")
-            if not isinstance(tool_name, str) or not tool_name.strip():
-                raise ValueError("tool 必须是非空字符串")
-            tool_name = tool_name.strip()
-            tool_input = payload.get("input")
-            if not isinstance(tool_input, dict):
-                raise ValueError("input 必须是对象")
-            self.tool_registry.validate(tool_name, tool_input)
-            return AgentAction(
-                action=action_type,
-                reason=reason.strip(),
-                evidence_refs=evidence_refs,
-                tool_call=ToolCall(tool=tool_name, input=tool_input),
-            )
-
-        if "tool" in payload or "input" in payload:
-            raise ValueError("finish 不能包含 tool 或 input")
         decision = RecoveryDecision(str(payload.get("decision", "")))
         return AgentAction(
-            action=action_type,
+            action=AgentActionType.FINISH,
             reason=reason.strip(),
-            evidence_refs=evidence_refs,
+            evidence_refs=self._parse_evidence_refs(payload.get("evidence_refs")),
             decision=decision,
         )
 

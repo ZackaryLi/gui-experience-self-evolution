@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 from .recovery_schemas import RecoveryContext, ToolObservation
@@ -16,6 +17,13 @@ class ToolValidationError(ValueError):
     pass
 
 
+class ToolOperation(str, Enum):
+    UNKNOWN = "UNKNOWN"
+    READ_ONLY = "READ_ONLY"
+    EXPERIMENT = "EXPERIMENT"
+    SENSITIVE = "SENSITIVE"
+
+
 @dataclass(frozen=True)
 class ToolDefinition:
     name: str
@@ -23,6 +31,8 @@ class ToolDefinition:
     input_schema: Dict[str, Any]
     handler: ToolHandler
     timeout_seconds: float = 10.0
+    operation: ToolOperation = ToolOperation.UNKNOWN
+    requires_intent_scope: bool = False
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name.strip():
@@ -39,6 +49,10 @@ class ToolDefinition:
             or self.timeout_seconds <= 0
         ):
             raise ValueError(f"工具 {self.name} 的 timeout_seconds 必须是正数")
+        if not isinstance(self.operation, ToolOperation):
+            raise ValueError(f"工具 {self.name} 的 operation 必须是 ToolOperation")
+        if not isinstance(self.requires_intent_scope, bool):
+            raise ValueError(f"工具 {self.name} 的 requires_intent_scope 必须是布尔值")
 
     def describe(self) -> Dict[str, Any]:
         return {
@@ -46,6 +60,8 @@ class ToolDefinition:
             "description": self.description,
             "input_schema": self.input_schema,
             "timeout_seconds": self.timeout_seconds,
+            "operation": self.operation.value,
+            "requires_intent_scope": self.requires_intent_scope,
         }
 
 
@@ -73,6 +89,19 @@ class ToolRegistry:
 
     def describe(self) -> List[Dict[str, Any]]:
         return [definition.describe() for definition in self._definitions.values()]
+
+    def to_openai_tools(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": definition.name,
+                    "description": definition.description,
+                    "parameters": definition.input_schema,
+                },
+            }
+            for definition in self._definitions.values()
+        ]
 
     def validate(self, name: str, tool_input: Dict[str, Any]) -> None:
         definition = self.get(name)
@@ -196,12 +225,16 @@ def build_default_tool_registry(context: RecoveryContext) -> ToolRegistry:
             description="读取当前意图的完整 Recovery 上下文，只能查询当前 intent_id。",
             input_schema=intent_schema,
             handler=get_recovery_context,
+            operation=ToolOperation.READ_ONLY,
+            requires_intent_scope=True,
         ),
         ToolDefinition(
             name="get_diagnosis_report",
             description="读取当前意图的结构化诊断报告；报告不存在时返回 NOT_FOUND。",
             input_schema=intent_schema,
             handler=get_diagnosis_report,
+            operation=ToolOperation.READ_ONLY,
+            requires_intent_scope=True,
         ),
         ToolDefinition(
             name="query_experiment_history",
@@ -211,6 +244,8 @@ def build_default_tool_registry(context: RecoveryContext) -> ToolRegistry:
             ),
             input_schema=history_schema,
             handler=query_experiment_history,
+            operation=ToolOperation.READ_ONLY,
+            requires_intent_scope=True,
         ),
         ToolDefinition(
             name="get_experience_version",
@@ -220,6 +255,8 @@ def build_default_tool_registry(context: RecoveryContext) -> ToolRegistry:
             ),
             input_schema=experience_schema,
             handler=get_experience_version,
+            operation=ToolOperation.READ_ONLY,
+            requires_intent_scope=True,
         ),
     ])
 
