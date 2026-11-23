@@ -78,3 +78,25 @@ class OODBatchValueConfig:
             "max_llm_attempts": self.max_llm_attempts,
             "max_total_attempts": self.max_total_attempts,
         }
+
+
+@dataclass(frozen=True)
+class OODRecoveryAgentConfig:
+    max_tool_rounds: int = 4
+    max_invalid_responses: int = 2
+
+    def __post_init__(self):
+        for name in ("max_tool_rounds", "max_invalid_responses"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} 必须是整数")
+        if self.max_tool_rounds < 0:
+            raise ValueError("max_tool_rounds 不能小于 0")
+        if self.max_invalid_responses <= 0:
+            raise ValueError("max_invalid_responses 必须大于 0")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_tool_rounds": self.max_tool_rounds,
+            "max_invalid_responses": self.max_invalid_responses,
+        }

@@ -1,9 +1,26 @@
 from .baseline import BaselinePlanner, FrozenBaselinePlanError
 from .batch_pipeline import OODBatchValuePipeline
 from .batch_value import BatchRunValueAssessor
-from .config import OODBaselineConfig, OODBatchValueConfig, OODTriageConfig
+from .config import (
+    OODBaselineConfig,
+    OODBatchValueConfig,
+    OODRecoveryAgentConfig,
+    OODTriageConfig,
+)
 from .embedding import EmbeddingPort
 from .pipeline import OODTriagePipeline
+from .recovery_agent import OODRecoveryAgent
+from .recovery_schemas import (
+    AgentAction,
+    AgentActionType,
+    AgentRunResult,
+    AgentRunStatus,
+    AgentStep,
+    RecoveryContext,
+    RecoveryDecision,
+    ToolCall,
+    ToolObservation,
+)
 from .runner import DeviceRunner
 from .schemas import (
     AttemptRequest,
@@ -29,6 +46,11 @@ from .schemas import (
 )
 
 __all__ = [
+    "AgentAction",
+    "AgentActionType",
+    "AgentRunResult",
+    "AgentRunStatus",
+    "AgentStep",
     "AttemptRequest",
     "AttemptResult",
     "AttemptStatus",
@@ -51,12 +73,18 @@ __all__ = [
     "OODBaselineConfig",
     "OODBatchValueConfig",
     "OODBatchValuePipeline",
+    "OODRecoveryAgent",
+    "OODRecoveryAgentConfig",
     "OODTriageConfig",
     "OODTriagePipeline",
+    "RecoveryContext",
+    "RecoveryDecision",
     "RecoveryState",
     "RecoveryStateSnapshot",
     "RecoveryValueAssessment",
     "RecoveryValueDecision",
     "StageProgress",
+    "ToolCall",
+    "ToolObservation",
     "TriageStatus",
 ]
