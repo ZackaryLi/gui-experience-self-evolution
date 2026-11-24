@@ -31,3 +31,12 @@ def atomic_write_jsonl(path: str | Path, records: Iterable[Any]) -> None:
     ]
     content = "\n".join(lines) + ("\n" if lines else "")
     _atomic_write_text(path, content)
+
+
+def append_jsonl(path: str | Path, record: Any) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "a", encoding="utf-8", newline="\n") as file:
+        file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        file.flush()
+        os.fsync(file.fileno())

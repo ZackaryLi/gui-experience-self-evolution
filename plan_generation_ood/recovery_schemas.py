@@ -97,6 +97,7 @@ class AgentStep(DictSerializable):
     observation: Optional[ToolObservation] = None
     validation_error: Optional[str] = None
     permission: Optional[PermissionDecision] = None
+    hook_error: Optional[str] = None
 
 
 @dataclass
@@ -108,3 +109,4 @@ class AgentRunResult(DictSerializable):
     llm_calls: int
     tool_rounds: int
     invalid_responses: int
+    run_id: str = ""

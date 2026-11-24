@@ -4,11 +4,32 @@ from .batch_value import BatchRunValueAssessor
 from .config import (
     OODBaselineConfig,
     OODBatchValueConfig,
+    OODPatchGeneratorConfig,
     OODRecoveryAgentConfig,
     OODTriageConfig,
 )
 from .embedding import EmbeddingPort
+from .experiment_plan import (
+    ExperimentPlan,
+    ExperimentPlanChange,
+    ExperimentPlanError,
+    ExperimentPlanItem,
+    ExperimentPlanStatus,
+)
+from .hooks import (
+    JsonlAuditHook,
+    PostToolUseEvent,
+    PreToolUseEvent,
+    ToolHook,
+    ToolHookError,
+    ToolHookRunner,
+)
 from .pipeline import OODTriagePipeline
+from .patch_generator import (
+    PatchGenerationError,
+    PatchGenerationResult,
+    PatchGenerator,
+)
 from .recovery_agent import OODRecoveryAgent
 from .recovery_schemas import (
     AgentAction,
@@ -25,6 +46,7 @@ from .recovery_schemas import (
 )
 from .runner import DeviceRunner
 from .safety import DefaultPermissionPolicy, PermissionPolicy
+from .skills import SkillDocument, SkillLoadError, SkillLoader, SkillMetadata
 from .tools import (
     ToolDefinition,
     ToolOperation,
@@ -78,28 +100,47 @@ __all__ = [
     "EvidenceRef",
     "ExperienceDraft",
     "ExperimentCard",
+    "ExperimentPlan",
+    "ExperimentPlanChange",
+    "ExperimentPlanError",
+    "ExperimentPlanItem",
+    "ExperimentPlanStatus",
     "FailurePattern",
     "FrozenBaselinePlanError",
     "IntentKey",
+    "JsonlAuditHook",
     "OODBaselineConfig",
     "OODBatchValueConfig",
     "OODBatchValuePipeline",
+    "OODPatchGeneratorConfig",
     "OODRecoveryAgent",
     "OODRecoveryAgentConfig",
     "OODTriageConfig",
     "OODTriagePipeline",
+    "PatchGenerationError",
+    "PatchGenerationResult",
+    "PatchGenerator",
     "PermissionDecision",
     "PermissionOutcome",
     "PermissionPolicy",
+    "PostToolUseEvent",
+    "PreToolUseEvent",
     "RecoveryContext",
     "RecoveryDecision",
     "RecoveryState",
     "RecoveryStateSnapshot",
     "RecoveryValueAssessment",
     "RecoveryValueDecision",
+    "SkillDocument",
+    "SkillLoadError",
+    "SkillLoader",
+    "SkillMetadata",
     "StageProgress",
     "ToolCall",
     "ToolDefinition",
+    "ToolHook",
+    "ToolHookError",
+    "ToolHookRunner",
     "ToolObservation",
     "ToolOperation",
     "ToolRegistry",

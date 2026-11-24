@@ -81,9 +81,36 @@ class OODBatchValueConfig:
 
 
 @dataclass(frozen=True)
+class OODPatchGeneratorConfig:
+    max_invalid_responses: int = 2
+    temperature: float = 0.1
+
+    def __post_init__(self):
+        if (
+            isinstance(self.max_invalid_responses, bool)
+            or not isinstance(self.max_invalid_responses, int)
+            or self.max_invalid_responses <= 0
+        ):
+            raise ValueError("max_invalid_responses 必须是正整数")
+        if (
+            isinstance(self.temperature, bool)
+            or not isinstance(self.temperature, (int, float))
+            or not 0.0 <= self.temperature <= 2.0
+        ):
+            raise ValueError("temperature 必须位于 0 和 2 之间")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_invalid_responses": self.max_invalid_responses,
+            "temperature": self.temperature,
+        }
+
+
+@dataclass(frozen=True)
 class OODRecoveryAgentConfig:
     max_tool_rounds: int = 4
     max_invalid_responses: int = 2
+    hook_timeout_seconds: float = 10.0
 
     def __post_init__(self):
         for name in ("max_tool_rounds", "max_invalid_responses"):
@@ -94,9 +121,16 @@ class OODRecoveryAgentConfig:
             raise ValueError("max_tool_rounds 不能小于 0")
         if self.max_invalid_responses <= 0:
             raise ValueError("max_invalid_responses 必须大于 0")
+        if (
+            isinstance(self.hook_timeout_seconds, bool)
+            or not isinstance(self.hook_timeout_seconds, (int, float))
+            or self.hook_timeout_seconds <= 0
+        ):
+            raise ValueError("hook_timeout_seconds 必须是正数")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "max_tool_rounds": self.max_tool_rounds,
             "max_invalid_responses": self.max_invalid_responses,
+            "hook_timeout_seconds": self.hook_timeout_seconds,
         }

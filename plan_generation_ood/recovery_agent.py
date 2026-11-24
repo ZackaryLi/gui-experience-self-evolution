@@ -1,8 +1,17 @@
 import asyncio
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+import time
+import uuid
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from .config import OODRecoveryAgentConfig
+from .hooks import (
+    PostToolUseEvent,
+    PreToolUseEvent,
+    ToolHook,
+    ToolHookError,
+    ToolHookRunner,
+)
 from .llm import extract_json
 from .recovery_prompts import build_initial_messages
 from .recovery_schemas import (
@@ -36,6 +45,7 @@ class OODRecoveryAgent:
         close_llm: bool = True,
         tool_registry: Optional[ToolRegistry] = None,
         permission_policy: Optional[PermissionPolicy] = None,
+        tool_hooks: Optional[Iterable[ToolHook]] = None,
     ):
         if not context.intent_id.strip():
             raise ValueError("RecoveryContext.intent_id 不能为空")
@@ -48,14 +58,24 @@ class OODRecoveryAgent:
         self.close_llm = close_llm
         self.tool_registry = tool_registry or build_default_tool_registry(context)
         self.permission_policy = permission_policy or DefaultPermissionPolicy()
+        self.tool_hook_runner = ToolHookRunner(
+            tool_hooks,
+            timeout_seconds=self.config.hook_timeout_seconds,
+        )
         self._allowed_evidence = self._index_evidence(context.evidence_refs)
+        self._run_id = ""
+        self._event_sequence = 0
 
     def run(self) -> AgentRunResult:
         return asyncio.run(self.arun())
 
     async def arun(self) -> AgentRunResult:
+        self._run_id = uuid.uuid4().hex
+        self._event_sequence = 0
         try:
-            return await self._run()
+            result = await self._run()
+            result.run_id = self._run_id
+            return result
         finally:
             if self.close_llm:
                 await self.llm.close()
@@ -268,11 +288,110 @@ class OODRecoveryAgent:
                     invalid_responses=invalid_responses,
                 )
 
+            definition = self.tool_registry.get(action.tool_call.tool)
+            self._event_sequence += 1
+            pre_event = PreToolUseEvent(
+                run_id=self._run_id,
+                step_id=step_id,
+                sequence=self._event_sequence,
+                tool_call_id=call_id,
+                tool=action.tool_call.tool,
+                intent_id=self.context.intent_id,
+                operation=definition.operation,
+                permission=permission,
+            )
+            try:
+                await self.tool_hook_runner.run_before(pre_event)
+            except ToolHookError as error:
+                observation = ToolObservation(
+                    tool=action.tool_call.tool,
+                    success=False,
+                    data={"hook": {
+                        "phase": error.phase,
+                        "hook": error.hook,
+                        "error_type": error.error_type,
+                        "handler_called": False,
+                    }},
+                    error=str(error),
+                )
+                steps.append(AgentStep(
+                    step_id=step_id,
+                    raw_response=raw_response,
+                    action=action,
+                    observation=observation,
+                    permission=permission,
+                    hook_error=str(error),
+                ))
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(
+                        observation.to_dict(),
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                })
+                return AgentRunResult(
+                    status=AgentRunStatus.MANUAL_REVIEW_REQUIRED,
+                    reason=str(error),
+                    decision=None,
+                    steps=steps,
+                    llm_calls=llm_calls,
+                    tool_rounds=tool_rounds,
+                    invalid_responses=invalid_responses,
+                )
+
+            started_at = time.perf_counter()
             observation = await self.tool_registry.dispatch(
                 action.tool_call.tool,
                 action.tool_call.input,
             )
+            duration_ms = (time.perf_counter() - started_at) * 1000
             tool_rounds += 1
+            self._event_sequence += 1
+            post_event = PostToolUseEvent(
+                run_id=self._run_id,
+                step_id=step_id,
+                sequence=self._event_sequence,
+                tool_call_id=call_id,
+                tool=action.tool_call.tool,
+                intent_id=self.context.intent_id,
+                operation=definition.operation,
+                permission=permission,
+                observation=observation,
+                duration_ms=duration_ms,
+                handler_called=True,
+            )
+            try:
+                await self.tool_hook_runner.run_after(post_event)
+            except ToolHookError as error:
+                steps.append(AgentStep(
+                    step_id=step_id,
+                    raw_response=raw_response,
+                    action=action,
+                    observation=observation,
+                    permission=permission,
+                    hook_error=str(error),
+                ))
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(
+                        observation.to_dict(),
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                })
+                return AgentRunResult(
+                    status=AgentRunStatus.MANUAL_REVIEW_REQUIRED,
+                    reason=str(error),
+                    decision=None,
+                    steps=steps,
+                    llm_calls=llm_calls,
+                    tool_rounds=tool_rounds,
+                    invalid_responses=invalid_responses,
+                )
+
             steps.append(AgentStep(
                 step_id=step_id,
                 raw_response=raw_response,
