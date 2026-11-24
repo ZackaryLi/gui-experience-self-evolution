@@ -55,6 +55,12 @@ MLOPS_MODEL = "qwen38-27b-vl"
 MAX_EMBEDDING_CONCURRENCY = 20
 MAX_INPUT_SIZE = 25
 
+
+class PlanGenerationError(Exception):
+    """意图组 Plan 生成失败（重试耗尽或产物无效），不写入结果文件。"""
+    pass
+
+
 with open("config.json", "r", encoding="utf-8") as f:
     config = json.load(f)
     EMBEDDING_TOKEN = config["embedding_api_key"]
@@ -257,6 +263,10 @@ class PlanGenerationPipeline:
 
             data, file_name, log_file = item
             try:
+                valid, invalid_reason = self._validate_plan_payload(data)
+                if not valid:
+                    log(f"拒绝写入无效结果: {file_name} | 原因: {invalid_reason}", log_file)
+                    continue
                 os.makedirs(os.path.dirname(file_name), exist_ok=True)
                 with open(file_name, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
@@ -334,6 +344,46 @@ class PlanGenerationPipeline:
                         f"阶段{p_idx}动作{a_idx}不符合 '页面（执行动作）' 格式: {action[:60]}"
                     )
         return errors
+
+    @classmethod
+    def _validate_plan_payload(cls, payload: Any) -> Tuple[bool, str]:
+        """校验最终 Plan 产物是否有效（生成、缓存、索引、导出共用）。
+
+        payload 支持三种形态：
+        - EfficientPlan 实例
+        - 落盘的 group_result dict（含 generated_plans）
+        - 已序列化的 generated_plans dict
+        返回 (是否有效, 失败原因)；失败原因为空字符串表示通过。
+        """
+        if hasattr(payload, "__dataclass_fields__"):
+            plan = cls.dataclass_to_dict(payload)
+        elif isinstance(payload, dict) and "generated_plans" in payload:
+            plan = payload.get("generated_plans")
+        else:
+            plan = payload
+
+        if not isinstance(plan, dict):
+            return False, "generated_plans 为空或不是 dict"
+        if not plan.get("app") or not plan.get("intent"):
+            return False, "app/intent 为空"
+
+        phases = plan.get("execution_plan")
+        if not isinstance(phases, list) or not phases:
+            return False, "execution_plan 为空"
+
+        for p_idx, phase in enumerate(phases, start=1):
+            if not isinstance(phase, dict):
+                return False, f"阶段{p_idx}不是 dict"
+            actions = phase.get("mapped_actions")
+            if not isinstance(actions, list) or not actions:
+                return False, f"阶段{p_idx}的 mapped_actions 为空"
+            for a_idx, action in enumerate(actions, start=1):
+                action = str(action)
+                if "->" in action:
+                    return False, f"阶段{p_idx}动作{a_idx}内部含 '->'"
+                if not cls.ACTION_FORMAT_RE.match(action):
+                    return False, f"阶段{p_idx}动作{a_idx}不符合 '页面（执行动作）' 格式"
+        return True, ""
 
     @staticmethod
     def _accumulate_token_usage(target: Dict[str, Any], source: Optional[Dict[str, Any]]):
@@ -939,7 +989,7 @@ class PlanGenerationPipeline:
             group: IntentGroup,
             analysis_result: Dict[str, Any],
             count_usage: bool = False,
-    ) -> List[EfficientPlan] | None:
+    ) -> EfficientPlan | None | Tuple[EfficientPlan | None, Dict[str, int]]:
         trajectories_mapping = {t.trajectory_id: t for t in group.trajectories}
         # app_name = group.trajectories[0].app if group.trajectories else "Unknown"
         redundant_analysis = analysis_result.get("redundant_analysis", {})
@@ -1047,6 +1097,21 @@ class PlanGenerationPipeline:
             return e
         group_result["generated_plans"] = self.dataclass_to_dict(plan)
 
+        # 生成失败（重试耗尽返回 None）或产物无效时，不落盘、不返回成功文件名。
+        # 返回 Exception 实例以复用 _run_scenario_jobs 的失败跳过逻辑；不要 raise，
+        # 因为 tqdm_asyncio.gather 默认 return_exceptions=False，raise 会中断整个场景。
+        valid, invalid_reason = self._validate_plan_payload(group_result)
+        if not valid:
+            log(
+                f"意图组处理失败 (Plan 产物无效) | 意图: {group_info} | 原因: {invalid_reason}",
+                self._intent_log_file(task_cls, app, group.intent_name)
+            )
+            log(
+                f"意图组处理失败 (Plan 产物无效) | 意图: {group_info} | 原因: {invalid_reason}",
+                work_dir / log_file
+            )
+            return PlanGenerationError(f"plan 产物无效: {invalid_reason}")
+
         # 落地文件
         safe_filename = sanitize_filename(f"{group.task_cls}-{group.app}-{group.intent_name}")
         intent_filename = f"{safe_filename}.json"
@@ -1061,9 +1126,6 @@ class PlanGenerationPipeline:
 
         return (group_result, intent_filename) if not count_usage else (group_result, intent_file, token_usage_record)
 
-    # =========================
-    # 5. 主Pipeline
-    # =========================
     # =========================
     # 5. 主Pipeline（跨场景统一调度）
     # =========================
@@ -1135,12 +1197,19 @@ class PlanGenerationPipeline:
                 try:
                     # 尝试读取，确认不是半写入或损坏的非法 json
                     cached_data = self.load_json(str(target_path))
-                    cached_results.append(cached_data)
-                    successful_filenames.append(intent_filename)
-                    log(f"[跳过生成] 检测到本地已存在有效意图结果: {intent_filename}", work_dir / log_file)
-                    continue
+                    valid, invalid_reason = self._validate_plan_payload(cached_data)
+                    if valid:
+                        cached_results.append(cached_data)
+                        successful_filenames.append(intent_filename)
+                        log(f"[跳过生成] 检测到本地已存在有效意图结果: {intent_filename}", work_dir / log_file)
+                        continue
+                    log(
+                        f"[缓存无效] 本地结果缺少有效 Plan，将重新生成: {intent_filename}, 原因: {invalid_reason}",
+                        work_dir / log_file
+                    )
                 except Exception as e:
-                    log(f"[检测异常] 读取本地已存在文件失败，重新生成: {intent_filename}, 错误: {e}", work_dir / log_file)
+                    log(f"[检测异常] 读取本地已存在文件失败，重新生成: {intent_filename}, 错误: {e}",
+                        work_dir / log_file)
 
             to_process_groups.append(group)
 
@@ -1161,10 +1230,13 @@ class PlanGenerationPipeline:
     def _finalize_scenario(self, job: Dict[str, Any]):
         """单场景收尾：合并意图索引、写执行统计日志"""
         successful_filenames = job["successful_filenames"]
+        intents_dir = job["intents_dir"]
+        index_file = intents_dir / "intents_index.json"
 
-        # 统一更新索引（合并历史与新生成的意图索引）
-        if successful_filenames:
-            index_file = job["intents_dir"] / "intents_index.json"
+        # 统一更新索引：只登记有效产物，并清理历史遗留的无效/缺失条目。
+        # 即使本次全部失败（successful_filenames 为空），只要索引已存在也要对账，
+        # 否则历史 null 条目会一直留在索引里，导出继续缺失。
+        if successful_filenames or os.path.exists(index_file):
             index_data = {"intents": []}
             if os.path.exists(index_file):
                 try:
@@ -1173,10 +1245,29 @@ class PlanGenerationPipeline:
                 except Exception:
                     pass
 
-            existing_intents = set(index_data.get("intents", []))
-            existing_intents.update(successful_filenames)
-            index_data["intents"] = list(existing_intents)
+            if not isinstance(index_data, dict):
+                index_data = {"intents": []}
 
+            existing_intents = set(index_data.get("intents") or [])
+            new_valid = set(successful_filenames)
+
+            # 本次未重新生成的历史条目，逐个校验；无效或文件缺失则剔除。
+            # 不能直接用 successful_filenames 重建索引：--intent 部分运行时，
+            # 本次未涉及的合法意图也必须保留。
+            kept_intents = set()
+            for filename in existing_intents - new_valid:
+                target_path = intents_dir / filename
+                if not target_path.exists():
+                    continue
+                try:
+                    cached_data = self.load_json(str(target_path))
+                    valid, _ = self._validate_plan_payload(cached_data)
+                    if valid:
+                        kept_intents.add(filename)
+                except Exception:
+                    pass
+
+            index_data["intents"] = sorted(kept_intents | new_valid)
             with open(index_file, "w", encoding="utf-8") as f:
                 json.dump(index_data, f, ensure_ascii=False, indent=4)
 
@@ -1438,24 +1529,31 @@ class PlanGenerationPipeline:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         p_json = json.load(f)
 
+                    if not isinstance(p_json, dict):
+                        tqdm.write(f"⚠️ 跳过无效结果（不是 JSON 对象）: {file_path}")
+                        continue
+
                     original_instructions = p_json.get('instructions', [])
+                    generated_plans = p_json.get("generated_plans")
+
+                    if not isinstance(generated_plans, dict):
+                        tqdm.write(f"⚠️ 跳过无效结果（generated_plans 为空）: {file_path}")
+                        continue
+                    if not generated_plans.get("app") or not generated_plans.get("intent"):
+                        tqdm.write(f"⚠️ 跳过无效结果（app/intent 为空）: {file_path}")
+                        continue
 
                     # 【关键修改 1】使用 await 替代 asyncio.run()
                     try:
-                        if not p_json:
-                            continue
-                        if not p_json.get("generated_plans", {}).get("app"):
-                            continue
-                        if not p_json.get("generated_plans", {}).get("intent"):
-                            continue
                         new_instructions = await self.llm_gen_instructions(
-                            app=p_json.get("generated_plans", {}).get("app"),
-                            intent=p_json.get("generated_plans", {}).get("intent"),
+                            app=generated_plans.get("app"),
+                            intent=generated_plans.get("intent"),
                             instructions=original_instructions,
                             generated_num=7,
                             count_usage=count_usage
                         )
-                    except Exception:
+                    except Exception as e:
+                        tqdm.write(f"⚠️ 指令生成失败，跳过: {file_path} | {type(e).__name__}: {e}")
                         continue
 
                     # 组合所有指令 (原有的 + 新生成的)
@@ -1464,19 +1562,19 @@ class PlanGenerationPipeline:
                     out = {
                         "_id": "",
                         "date": date.replace("-", ""),
-                        "task": p_json['generated_plans']['intent'],
-                        "description": p_json['generated_plans']['summary'],
-                        "app_name": [p_json['generated_plans']['app']],
+                        "task": generated_plans["intent"],
+                        "description": generated_plans.get("summary", ""),
+                        "app_name": [generated_plans["app"]],
                         "bundle_name": [],
                         "instructions": final_instructions,
                         "difficulty": "",
                         "content": "->".join(
                             ["->".join(item['mapped_actions']) for item in
-                             p_json['generated_plans']['execution_plan']]),
+                             generated_plans["execution_plan"]]),
                         "task_id": "",
-                        "confidence": p_json["generated_plans"]["confidence"],
-                        "confidence_details": p_json["generated_plans"]["confidence_breakdown"],
-                        "confidence_reason": p_json["generated_plans"]["confidence_reason"],
+                        "confidence": generated_plans.get("confidence"),
+                        "confidence_details": generated_plans.get("confidence_breakdown"),
+                        "confidence_reason": generated_plans.get("confidence_reason", ""),
                     }
                     output_plans.append(out)
 

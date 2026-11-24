@@ -165,8 +165,8 @@ def build_redundant_prompt(
         golden_path: List[str],
         trajectories: List[TrajectoryRecord]
 ) -> str:
-    traj_actions = [traj.get_actions() for traj in trajectories]
-    traj_plans = [traj.get_raw_plan() for traj in trajectories]
+    traj_actions = [traj.get_actions() if traj.get_actions() else ["none"] for traj in trajectories]
+    traj_plans = [traj.get_raw_plan() if traj.get_raw_plan() else "none" for traj in trajectories]
     return f"""
 # 角色设定
 你是一位顶级的 Agent 执行轨迹分析专家，你精通基于屏幕交互的 Agent 内部认知流（Thought）、GUI 动作空间（Tap, Swipe, Input, Long Press 等）以及页面状态转移逻辑。
