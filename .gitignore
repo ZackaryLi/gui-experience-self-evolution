@@ -234,3 +234,4 @@ data/*.db-wal
 
 .idea/
 *.md
+!plan_generation_ood/skills/**/SKILL.md

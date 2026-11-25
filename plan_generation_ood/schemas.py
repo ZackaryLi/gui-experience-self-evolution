@@ -360,12 +360,86 @@ class StageProgress(DictSerializable):
     evidence_steps: List[str]
     furthest_anchor: Optional[str] = None
     first_deviation_step: Optional[str] = None
+    repeated_action_steps: List[str] = field(default_factory=list)
+    page_oscillation_steps: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         if isinstance(self.stage_order, bool) or not isinstance(self.stage_order, int):
             raise ValueError("stage_order 必须是整数")
         if self.stage_order < 0:
             raise ValueError("stage_order 不能小于 0")
+
+
+@dataclass(frozen=True)
+class BusinessStage(DictSerializable):
+    stage_name: str
+    stage_order: int
+    description: str
+    completion_evidence: List[str]
+
+
+@dataclass(frozen=True)
+class BusinessStageRubric(DictSerializable):
+    intent_id: str
+    stages: List[BusinessStage]
+    rubric_id: str
+    prompt_version: str = "business_stage_rubric_v1"
+
+
+@dataclass(frozen=True)
+class AttemptVerdict(DictSerializable):
+    attempt_key: str
+    sessionid: str
+    completion_status: AttemptStatus
+    task_completed: Optional[bool]
+    completion_analysis: str
+    failure_analysis: str
+    primary_failure_parent_category: str
+    primary_failure_subcategory: str
+    key_evidence_steps: List[str]
+    confidence: float
+    blocker_type: str = ""
+
+
+@dataclass
+class AttemptAnalysis(DictSerializable):
+    attempt_key: str
+    instruction_id: str
+    attempt_index: int
+    sessionid: str
+    execution_status: AttemptStatus
+    execution_class: str
+    included_in_strategy: bool = False
+    conflict: bool = False
+    verdict: Optional[AttemptVerdict] = None
+    issues: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class BaselineAnalysisIssue(DictSerializable):
+    code: str
+    message: str
+    attempt_key: str = ""
+    instruction_id: str = ""
+
+
+@dataclass
+class BaselineStatistics(DictSerializable):
+    planned_count: int = 0
+    received_count: int = 0
+    completed_count: int = 0
+    failed_count: int = 0
+    uncertain_count: int = 0
+    device_error_count: int = 0
+    runner_error_count: int = 0
+    timeout_unknown_count: int = 0
+    not_dispatched_count: int = 0
+    cancelled_count: int = 0
+    valid_completed_count: int = 0
+    valid_failed_count: int = 0
+    conflict_count: int = 0
+    valid_attempt_keys: List[str] = field(default_factory=list)
+    excluded_attempt_keys: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -386,6 +460,16 @@ class DiagnosisReport(DictSerializable):
     failure_patterns: List[FailurePattern]
     summary: str
     evidence_quality: str = "UNKNOWN"
+    attempt_analyses: List[AttemptAnalysis] = field(default_factory=list)
+    overall_statistics: Optional[BaselineStatistics] = None
+    statistics_by_instruction: Dict[str, BaselineStatistics] = field(default_factory=dict)
+    stage_rubric: Optional[BusinessStageRubric] = None
+    issues: List[BaselineAnalysisIssue] = field(default_factory=list)
+    analysis_version: str = "baseline_analysis_v1"
+    created_at: str = ""
+    summary_skill_name: Optional[str] = None
+    summary_skill_version: Optional[str] = None
+    summary_skill_content_hash: Optional[str] = None
 
 
 @dataclass

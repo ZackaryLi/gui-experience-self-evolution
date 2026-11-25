@@ -107,6 +107,37 @@ class OODPatchGeneratorConfig:
 
 
 @dataclass(frozen=True)
+class OODBaselineAnalysisConfig:
+    max_invalid_responses: int = 2
+    min_verdict_confidence: float = 0.6
+    temperature: float = 0.1
+
+    def __post_init__(self):
+        if (
+            isinstance(self.max_invalid_responses, bool)
+            or not isinstance(self.max_invalid_responses, int)
+            or self.max_invalid_responses <= 0
+        ):
+            raise ValueError("max_invalid_responses 必须是正整数")
+        for name in ("min_verdict_confidence", "temperature"):
+            value = getattr(self, name)
+            upper = 1.0 if name == "min_verdict_confidence" else 2.0
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0.0 <= value <= upper
+            ):
+                raise ValueError(f"{name} 必须位于 0 和 {upper} 之间")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_invalid_responses": self.max_invalid_responses,
+            "min_verdict_confidence": self.min_verdict_confidence,
+            "temperature": self.temperature,
+        }
+
+
+@dataclass(frozen=True)
 class OODRecoveryAgentConfig:
     max_tool_rounds: int = 4
     max_invalid_responses: int = 2
