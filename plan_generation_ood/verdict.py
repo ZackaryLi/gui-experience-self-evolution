@@ -78,8 +78,12 @@ class AttemptVerdictAnalyzer:
     async def aanalyze(self, result: AttemptResult) -> AttemptVerdict:
         if not isinstance(result, AttemptResult):
             raise StructuredAnalysisError("result 必须是 AttemptResult")
-        if result.status not in {AttemptStatus.COMPLETED, AttemptStatus.FAILED}:
-            raise StructuredAnalysisError("只有正常 completed/failed 才能进行语义 Verdict")
+        if result.status not in {
+            AttemptStatus.FINISHED,
+            AttemptStatus.COMPLETED,
+            AttemptStatus.FAILED,
+        }:
+            raise StructuredAnalysisError("只有正常 finished/completed/failed 才能进行语义 Verdict")
         sessionid = result_sessionid(result)
         steps = trajectory_steps(result.trajectory)
         if not sessionid or not steps:

@@ -346,6 +346,7 @@ class OODRecoveryAgent:
                 action.tool_call.tool,
                 action.tool_call.input,
             )
+            self._absorb_observation_evidence(observation.data)
             duration_ms = (time.perf_counter() - started_at) * 1000
             tool_rounds += 1
             self._event_sequence += 1
@@ -475,7 +476,14 @@ class OODRecoveryAgent:
         payload = extract_json(content, default={})
         if not isinstance(payload, dict):
             raise ValueError("最终决策必须是 JSON 对象")
-        allowed_fields = {"decision", "reason", "evidence_refs"}
+        allowed_fields = {
+            "decision",
+            "reason",
+            "evidence_refs",
+            "experiment_id",
+            "conclusion",
+            "hypothesis",
+        }
         unknown_fields = set(payload) - allowed_fields
         if unknown_fields:
             raise ValueError(f"最终决策包含未知字段: {sorted(unknown_fields)}")
@@ -483,11 +491,18 @@ class OODRecoveryAgent:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason 必须是非空字符串")
         decision = RecoveryDecision(str(payload.get("decision", "")))
+        optional = {}
+        for name in ("experiment_id", "conclusion", "hypothesis"):
+            value = payload.get(name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} 必须是非空字符串或 null")
+            optional[name] = value.strip() if isinstance(value, str) else None
         return AgentAction(
             action=AgentActionType.FINISH,
             reason=reason.strip(),
             evidence_refs=self._parse_evidence_refs(payload.get("evidence_refs")),
             decision=decision,
+            **optional,
         )
 
     def _parse_evidence_refs(self, raw_refs: Any) -> List[EvidenceRef]:
@@ -510,6 +525,35 @@ class OODRecoveryAgent:
                 raise ValueError(f"引用了不存在的证据步骤: {sorted(unknown_steps)}")
             refs.append(EvidenceRef(sessionid=sessionid, step_ids=list(step_ids)))
         return refs
+
+    def _absorb_observation_evidence(self, value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                self._absorb_observation_evidence(item)
+            return
+        if not isinstance(value, dict):
+            return
+        sessionid = value.get("sessionid")
+        if isinstance(sessionid, str) and sessionid.strip():
+            for field_name in ("step_ids", "key_evidence_steps"):
+                steps = value.get(field_name)
+                if isinstance(steps, list) and all(
+                    isinstance(step, str) for step in steps
+                ):
+                    self._allowed_evidence.setdefault(sessionid, set()).update(steps)
+        trajectory = value.get("trajectory")
+        if isinstance(trajectory, dict):
+            trajectory_session = trajectory.get("sessionid")
+            if isinstance(trajectory_session, str) and trajectory_session.strip():
+                steps = [
+                    key for key in trajectory
+                    if isinstance(key, str)
+                    and key.startswith("step")
+                    and key[4:].isdigit()
+                ]
+                self._allowed_evidence.setdefault(trajectory_session, set()).update(steps)
+        for item in value.values():
+            self._absorb_observation_evidence(item)
 
     @staticmethod
     def _index_evidence(evidence_refs: List[EvidenceRef]) -> Dict[str, set]:

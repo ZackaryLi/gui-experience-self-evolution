@@ -23,12 +23,12 @@ if TYPE_CHECKING:
 
 
 PATCH_SYSTEM_PROMPT = """你是 OOD Recovery 内部的经验起草器，不负责选择探索方向或判断实验成功。
-围绕输入中的当前活动假设，只起草一个候选经验版本。
+围绕输入中的 expected_hypothesis，只起草一个候选经验版本。
 只输出 JSON 对象，不要输出 Markdown 或额外解释。
 JSON 必须且只能包含：
 hypothesis、applicable_scope、trigger_conditions、strategy、expected_stage、
 evidence_refs、forbidden_behaviors、exit_conditions、change_summary。
-hypothesis 必须原样复制当前活动假设；evidence_refs 只能引用输入中存在的轨迹和步骤。
+hypothesis 必须原样复制 expected_hypothesis；evidence_refs 只能引用输入中存在的轨迹和步骤。
 REVISE_EXPERIENCE 应保留已有经验中仍有效的部分，只针对最新失败锚点增量修改。
 PROPOSE_EXPERIENCE 只能用于原方向已被否定后的新方向，不得重复已否定假设。
 不得把设备、Runner、超时或结果不确定解释为经验无效，不得编造页面、功能或证据。
@@ -82,6 +82,7 @@ class PatchGenerator:
         experiment_feedback: List[AttemptResult],
         mode: RecoveryDecision,
         version_diff: Optional[Dict[str, Any]] = None,
+        new_hypothesis: Optional[str] = None,
     ) -> PatchGenerationResult:
         return asyncio.run(self.agenerate(
             plan=plan,
@@ -90,6 +91,7 @@ class PatchGenerator:
             experiment_feedback=experiment_feedback,
             mode=mode,
             version_diff=version_diff,
+            new_hypothesis=new_hypothesis,
         ))
 
     async def agenerate(
@@ -100,14 +102,16 @@ class PatchGenerator:
         experiment_feedback: List[AttemptResult],
         mode: RecoveryDecision,
         version_diff: Optional[Dict[str, Any]] = None,
+        new_hypothesis: Optional[str] = None,
     ) -> PatchGenerationResult:
-        active_item, feedback = self._validate_inputs(
+        active_item, feedback, expected_hypothesis = self._validate_inputs(
             plan,
             diagnosis,
             current_experience,
             experiment_feedback,
             mode,
             version_diff,
+            new_hypothesis,
         )
         allowed_evidence = self._allowed_evidence(
             plan,
@@ -129,6 +133,10 @@ class PatchGenerator:
             "mode": mode.value,
             "intent_id": plan.intent_id,
             "active_hypothesis": active_item.to_dict(),
+            "expected_hypothesis": expected_hypothesis,
+            "source_direction_conclusion": (
+                "REFUTED" if mode is RecoveryDecision.PROPOSE_EXPERIENCE else "EXPLORING"
+            ),
             "diagnosis": diagnosis.to_dict(),
             "current_experience": current_experience.to_dict(),
             "version_diff": version_diff or {},
@@ -169,7 +177,7 @@ class PatchGenerator:
                 payload = extract_json(content, default={})
                 validated, change_summary = self._validate_payload(
                     payload,
-                    active_item.hypothesis,
+                    expected_hypothesis,
                     allowed_evidence,
                 )
             except (TypeError, ValueError) as error:
@@ -231,7 +239,8 @@ class PatchGenerator:
         experiment_feedback: List[AttemptResult],
         mode: RecoveryDecision,
         version_diff: Optional[Dict[str, Any]],
-    ) -> Tuple[Any, List[AttemptResult]]:
+        new_hypothesis: Optional[str],
+    ) -> Tuple[Any, List[AttemptResult], str]:
         if not isinstance(plan, ExperimentPlan):
             raise PatchGenerationError("plan 必须是 ExperimentPlan")
         if not isinstance(diagnosis, DiagnosisReport):
@@ -258,7 +267,20 @@ class PatchGenerator:
             item for item in plan.items
             if item.status is ExperimentPlanStatus.REFUTED
         ]
-        if mode is RecoveryDecision.PROPOSE_EXPERIENCE and not refuted:
+        expected_hypothesis = active_item.hypothesis
+        if new_hypothesis is not None:
+            if mode is not RecoveryDecision.PROPOSE_EXPERIENCE:
+                raise PatchGenerationError("只有 PROPOSE_EXPERIENCE 可以指定新假设")
+            if not isinstance(new_hypothesis, str) or not new_hypothesis.strip():
+                raise PatchGenerationError("新假设必须是非空字符串")
+            normalized = " ".join(new_hypothesis.strip().lower().split())
+            if any(
+                " ".join(item.hypothesis.lower().split()) == normalized
+                for item in plan.items
+            ):
+                raise PatchGenerationError("新方向不能重复计划中的既有假设")
+            expected_hypothesis = new_hypothesis.strip()
+        elif mode is RecoveryDecision.PROPOSE_EXPERIENCE and not refuted:
             raise PatchGenerationError("只有原方向被否定后才能生成新方向草稿")
         if not isinstance(experiment_feedback, list) or any(
             not isinstance(item, AttemptResult) for item in experiment_feedback
@@ -276,7 +298,7 @@ class PatchGenerator:
             raise PatchGenerationError(
                 "没有与当前经验版本匹配的正常完成或失败反馈，不能生成修订"
             )
-        return active_item, feedback
+        return active_item, feedback, expected_hypothesis
 
     @staticmethod
     def _new_experience_id(current: ExperienceDraft) -> str:
@@ -303,7 +325,11 @@ class PatchGenerator:
                 refs.extend(item.result_evidence_refs)
         allowed = self._index_evidence(refs)
         for result in list(diagnosis.attempt_results) + list(feedback):
-            if result.status not in {AttemptStatus.COMPLETED, AttemptStatus.FAILED}:
+            if result.status not in {
+                AttemptStatus.FINISHED,
+                AttemptStatus.COMPLETED,
+                AttemptStatus.FAILED,
+            }:
                 continue
             ref = self._attempt_evidence(result)
             if ref is not None:

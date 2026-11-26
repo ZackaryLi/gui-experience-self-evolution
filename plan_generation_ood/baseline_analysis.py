@@ -30,7 +30,11 @@ class BaselineAnalysisError(ValueError):
 
 
 class BaselineAnalyzer:
-    NORMAL_STATUSES = {AttemptStatus.COMPLETED, AttemptStatus.FAILED}
+    NORMAL_STATUSES = {
+        AttemptStatus.FINISHED,
+        AttemptStatus.COMPLETED,
+        AttemptStatus.FAILED,
+    }
     INFRASTRUCTURE_STATUSES = {
         AttemptStatus.DEVICE_ERROR,
         AttemptStatus.RUNNER_ERROR,
@@ -273,14 +277,23 @@ class BaselineAnalyzer:
         if result.status not in self.NORMAL_STATUSES:
             return analysis
 
-        expected_flag = result.status is AttemptStatus.COMPLETED
-        if result.task_completed is not expected_flag:
+        if result.status in {AttemptStatus.COMPLETED, AttemptStatus.FAILED}:
+            expected_flag = result.status is AttemptStatus.COMPLETED
+            if result.task_completed is not expected_flag:
+                analysis.conflict = True
+                self._record_issue(
+                    issues,
+                    analysis,
+                    "COMPLETION_FLAG_CONFLICT",
+                    "原始业务状态与 task_completed 不一致，保留冲突并排除策略统计",
+                )
+        elif result.task_completed is not None:
             analysis.conflict = True
             self._record_issue(
                 issues,
                 analysis,
-                "COMPLETION_FLAG_CONFLICT",
-                "原始 status 与 task_completed 不一致，保留冲突并排除策略统计",
+                "FINISHED_WITH_BUSINESS_FLAG",
+                "业务中性的 finished 不应预设 task_completed，保留冲突并排除策略统计",
             )
         if not analysis.sessionid or not trajectory_steps(result.trajectory):
             self._record_issue(
@@ -311,19 +324,20 @@ class BaselineAnalyzer:
                 "独立 Verdict 证据不足，不参与策略统计",
             )
             return analysis
-        expected_status = (
-            AttemptStatus.COMPLETED
-            if verdict.completion_status is AttemptStatus.COMPLETED
-            else AttemptStatus.FAILED
-        )
-        if result.status is not expected_status:
-            analysis.conflict = True
-            self._record_issue(
-                issues,
-                analysis,
-                "VERDICT_STATUS_CONFLICT",
-                "独立 Verdict 与原始执行状态冲突，不自动覆盖任何一方",
+        if result.status in {AttemptStatus.COMPLETED, AttemptStatus.FAILED}:
+            expected_status = (
+                AttemptStatus.COMPLETED
+                if verdict.completion_status is AttemptStatus.COMPLETED
+                else AttemptStatus.FAILED
             )
+            if result.status is not expected_status:
+                analysis.conflict = True
+                self._record_issue(
+                    issues,
+                    analysis,
+                    "VERDICT_STATUS_CONFLICT",
+                    "独立 Verdict 与原始业务状态冲突，不自动覆盖任何一方",
+                )
         if (
             result.task_completed is not None
             and result.task_completed != verdict.task_completed

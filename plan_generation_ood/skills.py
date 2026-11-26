@@ -7,7 +7,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from .schemas import DictSerializable
 
 
-DEFAULT_SKILL_NAMES = frozenset({"experience_revision", "diagnosis_summary"})
+DEFAULT_SKILL_NAMES = frozenset({
+    "experience_revision",
+    "diagnosis_summary",
+    "initial_experience",
+})
 DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
 
 

@@ -79,6 +79,9 @@ class AgentAction(DictSerializable):
     evidence_refs: List[EvidenceRef]
     tool_call: Optional[ToolCall] = None
     decision: Optional[RecoveryDecision] = None
+    experiment_id: Optional[str] = None
+    conclusion: Optional[str] = None
+    hypothesis: Optional[str] = None
 
 
 @dataclass(frozen=True)

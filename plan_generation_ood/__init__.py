@@ -6,11 +6,21 @@ from .config import (
     OODBaselineAnalysisConfig,
     OODBaselineConfig,
     OODBatchValueConfig,
+    OODExperimentConfig,
+    OODInitialExperienceConfig,
     OODPatchGeneratorConfig,
     OODRecoveryAgentConfig,
+    OODRecoveryValueConfig,
     OODTriageConfig,
 )
 from .embedding import EmbeddingPort
+from .experiments import (
+    ExperimentBudgetExceeded,
+    ExperimentExecutionError,
+    ExperimentExecutionResult,
+    ExperimentExecutor,
+    RunnerNotConfiguredError,
+)
 from .experiment_plan import (
     ExperimentPlan,
     ExperimentPlanChange,
@@ -26,6 +36,25 @@ from .hooks import (
     ToolHookError,
     ToolHookRunner,
 )
+from .initial_experience import (
+    InitialExperienceError,
+    InitialExperienceGenerator,
+    InitialExperienceResult,
+)
+from .memory import (
+    ArtifactConflictError,
+    ExperimentEvent,
+    ExperimentStore,
+    ExperienceRegistry,
+    ExperienceVersionRecord,
+    JournalEntry,
+    RecoveryMemory,
+    RecoveryMemoryError,
+    StateConflictError,
+    StateStore,
+    WorkflowJournal,
+    experience_version_id,
+)
 from .pipeline import OODTriagePipeline
 from .patch_generator import (
     PatchGenerationError,
@@ -33,6 +62,17 @@ from .patch_generator import (
     PatchGenerator,
 )
 from .recovery_agent import OODRecoveryAgent
+from .recovery_harness import (
+    RecoveryHarness,
+    RecoveryHarnessError,
+    RecoveryIterationResult,
+    build_experiment_tool_definitions,
+)
+from .recovery_pipeline import (
+    FixedPreparationResult,
+    RecoveryWorkflow,
+    RecoveryWorkflowError,
+)
 from .recovery_schemas import (
     AgentAction,
     AgentActionType,
@@ -46,9 +86,45 @@ from .recovery_schemas import (
     ToolCall,
     ToolObservation,
 )
+from .recovery_value import RecoveryValueAssessor, RecoveryValueError
 from .progress import BusinessStageAnalyzer
-from .runner import DeviceRunner
-from .safety import DefaultPermissionPolicy, PermissionPolicy
+from .runner import (
+    CancelResult,
+    DeviceRunner,
+    ExecutionStatus,
+    ExperienceMode,
+    InfrastructureStatus,
+    RunnerHealth,
+    RunRequest,
+    RunResult,
+)
+from .local_runner import (
+    DeviceTaskApi,
+    LocalDeviceRunner,
+    LocalRunnerConfigError,
+    RunnerClosedError,
+    RunnerStore,
+    ScriptDeviceTaskApi,
+    StepDataTrajectoryAdapter,
+    result_from_dict,
+    request_from_dict,
+)
+from .runner_adapter import (
+    RunAttemptContext,
+    RunnerAdapter,
+    RunnerAdapterError,
+    RunnerResultNotFound,
+    RunnerResultNotReady,
+    TrajectoryAdapter,
+    experience_to_plan_text,
+)
+from .intent_orchestrator import (
+    IntentOrchestratorError,
+    IntentRunReport,
+    IterationRecord,
+    OODIntentOrchestrator,
+)
+from .safety import DefaultPermissionPolicy, ExecutionPermissionPolicy, PermissionPolicy
 from .skills import SkillDocument, SkillLoadError, SkillLoader, SkillMetadata
 from .tools import (
     ToolDefinition,
@@ -79,12 +155,14 @@ from .schemas import (
     ExperimentCard,
     FailurePattern,
     IntentKey,
+    LoadedTrajectory,
     RecoveryState,
     RecoveryStateSnapshot,
     RecoveryValueAssessment,
     RecoveryValueDecision,
     StageProgress,
     TriageStatus,
+    content_hash,
 )
 
 __all__ = [
@@ -93,6 +171,7 @@ __all__ = [
     "AgentRunResult",
     "AgentRunStatus",
     "AgentStep",
+    "ArtifactConflictError",
     "AttemptAnalysis",
     "AttemptRequest",
     "AttemptResult",
@@ -125,17 +204,30 @@ __all__ = [
     "ExperimentPlanError",
     "ExperimentPlanItem",
     "ExperimentPlanStatus",
+    "ExperimentEvent",
+    "ExperimentStore",
+    "ExperienceRegistry",
+    "ExperienceVersionRecord",
     "FailurePattern",
+    "FixedPreparationResult",
     "FrozenBaselinePlanError",
+    "InitialExperienceError",
+    "InitialExperienceGenerator",
+    "InitialExperienceResult",
     "IntentKey",
+    "LoadedTrajectory",
+    "content_hash",
+    "JournalEntry",
     "JsonlAuditHook",
     "OODBaselineAnalysisConfig",
     "OODBaselineConfig",
     "OODBatchValueConfig",
     "OODBatchValuePipeline",
+    "OODInitialExperienceConfig",
     "OODPatchGeneratorConfig",
     "OODRecoveryAgent",
     "OODRecoveryAgentConfig",
+    "OODRecoveryValueConfig",
     "OODTriageConfig",
     "OODTriagePipeline",
     "PatchGenerationError",
@@ -148,15 +240,23 @@ __all__ = [
     "PreToolUseEvent",
     "RecoveryContext",
     "RecoveryDecision",
+    "RecoveryMemory",
+    "RecoveryMemoryError",
     "RecoveryState",
     "RecoveryStateSnapshot",
     "RecoveryValueAssessment",
+    "RecoveryValueAssessor",
     "RecoveryValueDecision",
+    "RecoveryValueError",
+    "RecoveryWorkflow",
+    "RecoveryWorkflowError",
     "SkillDocument",
     "SkillLoadError",
     "SkillLoader",
     "SkillMetadata",
     "StageProgress",
+    "StateConflictError",
+    "StateStore",
     "ToolCall",
     "ToolDefinition",
     "ToolHook",
@@ -167,5 +267,49 @@ __all__ = [
     "ToolRegistry",
     "ToolValidationError",
     "TriageStatus",
+    "WorkflowJournal",
     "build_default_tool_registry",
+    "experience_version_id",
+]
+
+
+__all__ += [
+    "CancelResult",
+    "DeviceTaskApi",
+    "ExecutionPermissionPolicy",
+    "ExecutionStatus",
+    "ExperienceMode",
+    "ExperimentBudgetExceeded",
+    "ExperimentExecutionError",
+    "ExperimentExecutionResult",
+    "ExperimentExecutor",
+    "InfrastructureStatus",
+    "IntentOrchestratorError",
+    "IntentRunReport",
+    "IterationRecord",
+    "LocalDeviceRunner",
+    "LocalRunnerConfigError",
+    "OODExperimentConfig",
+    "OODIntentOrchestrator",
+    "RecoveryHarness",
+    "RecoveryHarnessError",
+    "RecoveryIterationResult",
+    "RunAttemptContext",
+    "RunRequest",
+    "RunResult",
+    "RunnerAdapter",
+    "RunnerAdapterError",
+    "RunnerClosedError",
+    "RunnerHealth",
+    "RunnerNotConfiguredError",
+    "RunnerResultNotFound",
+    "RunnerResultNotReady",
+    "RunnerStore",
+    "ScriptDeviceTaskApi",
+    "StepDataTrajectoryAdapter",
+    "TrajectoryAdapter",
+    "build_experiment_tool_definitions",
+    "experience_to_plan_text",
+    "request_from_dict",
+    "result_from_dict",
 ]

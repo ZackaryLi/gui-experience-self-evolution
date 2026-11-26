@@ -6,6 +6,7 @@ from .recovery_schemas import (
     RecoveryContext,
     ToolCall,
 )
+from .schemas import RecoveryState
 from .tools import ToolDefinition, ToolOperation
 
 
@@ -109,4 +110,50 @@ class DefaultPermissionPolicy:
                 "operation": definition.operation.value,
                 **(details or {}),
             },
+        )
+
+
+class ExecutionPermissionPolicy:
+    def __init__(self, execution_authorized: bool = False):
+        self.execution_authorized = execution_authorized
+        self.read_only = DefaultPermissionPolicy()
+
+    def evaluate(
+        self,
+        context: RecoveryContext,
+        definition: ToolDefinition,
+        call: ToolCall,
+    ) -> PermissionDecision:
+        if definition.operation is not ToolOperation.EXPERIMENT:
+            return self.read_only.evaluate(context, definition, call)
+        if not self.execution_authorized:
+            return DefaultPermissionPolicy._decision(
+                PermissionOutcome.MANUAL_REVIEW,
+                "EXPERIMENT_NOT_AUTHORIZED",
+                "当前 Harness 未获得真机实验授权。",
+                context,
+                definition,
+            )
+        if context.state is not RecoveryState.EXPERIENCE_EXPLORING:
+            return DefaultPermissionPolicy._decision(
+                PermissionOutcome.DENY,
+                "EXPERIMENT_STATE_DENIED",
+                "只有 EXPERIENCE_EXPLORING 可以提交或取消探索实验。",
+                context,
+                definition,
+            )
+        if call.input.get("intent_id") != context.intent_id:
+            return DefaultPermissionPolicy._decision(
+                PermissionOutcome.DENY,
+                "INTENT_SCOPE_VIOLATION",
+                "实验工具不能访问其他 intent。",
+                context,
+                definition,
+            )
+        return DefaultPermissionPolicy._decision(
+            PermissionOutcome.ALLOW,
+            "EXPERIMENT_WITHIN_SCOPE",
+            "实验工具已获得执行授权且 intent 范围一致；执行器仍将校验预算和计划。",
+            context,
+            definition,
         )

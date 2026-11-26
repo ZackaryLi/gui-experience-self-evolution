@@ -151,7 +151,11 @@ class ToolRegistry:
         return result
 
 
-def build_default_tool_registry(context: RecoveryContext) -> ToolRegistry:
+def build_default_tool_registry(
+    context: RecoveryContext,
+    context_provider: Optional[Callable[[], RecoveryContext]] = None,
+) -> ToolRegistry:
+    provider = context_provider or (lambda: context)
     intent_property = {"type": "string", "const": context.intent_id}
     intent_schema = {
         "type": "object",
@@ -161,21 +165,23 @@ def build_default_tool_registry(context: RecoveryContext) -> ToolRegistry:
     }
 
     def get_recovery_context(tool_input: Dict[str, Any]) -> Dict[str, Any]:
-        return {"status": "OK", "context": context.to_dict()}
+        return {"status": "OK", "context": provider().to_dict()}
 
     def get_diagnosis_report(tool_input: Dict[str, Any]) -> Dict[str, Any]:
-        if context.diagnosis is None:
-            return {"status": "NOT_FOUND", "intent_id": context.intent_id}
-        return {"status": "OK", "diagnosis": context.diagnosis.to_dict()}
+        current = provider()
+        if current.diagnosis is None:
+            return {"status": "NOT_FOUND", "intent_id": current.intent_id}
+        return {"status": "OK", "diagnosis": current.diagnosis.to_dict()}
 
     def query_experiment_history(tool_input: Dict[str, Any]) -> Dict[str, Any]:
+        current = provider()
         experiment_id = tool_input.get("experiment_id")
         limit = tool_input.get("limit", 20)
         matches = []
-        for item in context.history:
+        for item in current.history:
             if not isinstance(item, dict):
                 raise ValueError("RecoveryContext.history 的每一项都必须是字典")
-            if item.get("intent_id", context.intent_id) != context.intent_id:
+            if item.get("intent_id", current.intent_id) != current.intent_id:
                 continue
             if experiment_id is not None and item.get("experiment_id") != experiment_id:
                 continue
@@ -188,14 +194,15 @@ def build_default_tool_registry(context: RecoveryContext) -> ToolRegistry:
         }
 
     def get_experience_version(tool_input: Dict[str, Any]) -> Dict[str, Any]:
-        experience = context.current_experience
+        current = provider()
+        experience = current.current_experience
         requested_id = tool_input.get("experience_id")
         if experience is None or (
             requested_id is not None and experience.experience_id != requested_id
         ):
             return {
                 "status": "NOT_FOUND",
-                "intent_id": context.intent_id,
+                "intent_id": current.intent_id,
                 "experience_id": requested_id,
             }
         return {"status": "OK", "experience": experience.to_dict()}

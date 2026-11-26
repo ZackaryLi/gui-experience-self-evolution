@@ -138,6 +138,63 @@ class OODBaselineAnalysisConfig:
 
 
 @dataclass(frozen=True)
+class OODRecoveryValueConfig:
+    max_invalid_responses: int = 2
+    min_llm_confidence: float = 0.6
+    temperature: float = 0.1
+
+    def __post_init__(self):
+        if (
+            isinstance(self.max_invalid_responses, bool)
+            or not isinstance(self.max_invalid_responses, int)
+            or self.max_invalid_responses <= 0
+        ):
+            raise ValueError("max_invalid_responses 必须是正整数")
+        for name in ("min_llm_confidence", "temperature"):
+            value = getattr(self, name)
+            upper = 1.0 if name == "min_llm_confidence" else 2.0
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0.0 <= value <= upper
+            ):
+                raise ValueError(f"{name} 必须位于 0 和 {upper} 之间")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_invalid_responses": self.max_invalid_responses,
+            "min_llm_confidence": self.min_llm_confidence,
+            "temperature": self.temperature,
+        }
+
+
+@dataclass(frozen=True)
+class OODInitialExperienceConfig:
+    max_invalid_responses: int = 2
+    temperature: float = 0.1
+
+    def __post_init__(self):
+        if (
+            isinstance(self.max_invalid_responses, bool)
+            or not isinstance(self.max_invalid_responses, int)
+            or self.max_invalid_responses <= 0
+        ):
+            raise ValueError("max_invalid_responses 必须是正整数")
+        if (
+            isinstance(self.temperature, bool)
+            or not isinstance(self.temperature, (int, float))
+            or not 0.0 <= self.temperature <= 2.0
+        ):
+            raise ValueError("temperature 必须位于 0 和 2 之间")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_invalid_responses": self.max_invalid_responses,
+            "temperature": self.temperature,
+        }
+
+
+@dataclass(frozen=True)
 class OODRecoveryAgentConfig:
     max_tool_rounds: int = 4
     max_invalid_responses: int = 2
@@ -164,4 +221,39 @@ class OODRecoveryAgentConfig:
             "max_tool_rounds": self.max_tool_rounds,
             "max_invalid_responses": self.max_invalid_responses,
             "hook_timeout_seconds": self.hook_timeout_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class OODExperimentConfig:
+    max_experiments: int = 6
+    max_attempts_per_experiment: int = 6
+    max_total_attempts: int = 24
+    runner_timeout_sec: int = 600
+    tool_timeout_seconds: float = 3900.0
+
+    def __post_init__(self):
+        for name in (
+            "max_experiments",
+            "max_attempts_per_experiment",
+            "max_total_attempts",
+            "runner_timeout_sec",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} 必须是正整数")
+        if (
+            isinstance(self.tool_timeout_seconds, bool)
+            or not isinstance(self.tool_timeout_seconds, (int, float))
+            or self.tool_timeout_seconds <= 0
+        ):
+            raise ValueError("tool_timeout_seconds 必须是正数")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_experiments": self.max_experiments,
+            "max_attempts_per_experiment": self.max_attempts_per_experiment,
+            "max_total_attempts": self.max_total_attempts,
+            "runner_timeout_sec": self.runner_timeout_sec,
+            "tool_timeout_seconds": self.tool_timeout_seconds,
         }

@@ -203,6 +203,7 @@ class RecoveryValueDecision(str, Enum):
 
 
 class AttemptStatus(str, Enum):
+    FINISHED = "finished"
     COMPLETED = "completed"
     FAILED = "failed"
     UNCERTAIN = "uncertain"
@@ -427,6 +428,7 @@ class BaselineAnalysisIssue(DictSerializable):
 class BaselineStatistics(DictSerializable):
     planned_count: int = 0
     received_count: int = 0
+    finished_count: int = 0
     completed_count: int = 0
     failed_count: int = 0
     uncertain_count: int = 0
@@ -480,6 +482,19 @@ class RecoveryValueAssessment(DictSerializable):
     reason: str
     evidence_refs: List[EvidenceRef]
     initial_experience: Optional[ExperienceDraft] = None
+    confidence: float = 0.0
+    repair_potential: str = "UNKNOWN"
+    intervention_rationale: str = ""
+    primary_failure_pattern_id: str = ""
+    primary_hypothesis: str = ""
+    expected_stage: str = ""
+    falsification_conditions: List[str] = field(default_factory=list)
+    blocker_type: str = ""
+    llm_decision: Optional[RecoveryValueDecision] = None
+    assessment_mode: str = "DETERMINISTIC_PRECHECK"
+    rule_findings: List[str] = field(default_factory=list)
+    prompt_version: str = "recovery_value_v1"
+    created_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -506,3 +521,12 @@ class RecoveryStateSnapshot(DictSerializable):
     round_index: int = 0
     budget: Dict[str, Any] = field(default_factory=dict)
     history: List[Dict[str, Any]] = field(default_factory=list)
+    schema_version: str = "1.0"
+    revision: int = 0
+    baseline_plan_id: Optional[str] = None
+    blocker_reason: str = ""
+    allowed_actions: List[str] = field(default_factory=list)
+    artifact_hashes: Dict[str, str] = field(default_factory=dict)
+    last_transition_id: str = ""
+    created_at: str = ""
+    updated_at: str = ""
