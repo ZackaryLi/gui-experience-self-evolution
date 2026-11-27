@@ -62,6 +62,41 @@ SUBCATEGORY_NAME = {
     "E2": "数据跨App传递",
 }
 
+def resolve_task_completed(verdict: t.Any) -> t.Tuple[t.Optional[bool], t.Optional[str]]:
+    """
+    显式解析 verdict 中的 task_completed 完成状态，只信任真正的布尔值。
+
+    返回 (task_completed, invalid_reason)：
+    - task_completed 为 True/False 时 invalid_reason 为 None，可直接用于 IND/OOD 分流；
+    - 无法确定时 task_completed 为 None，invalid_reason 说明原因。调用方应按解析失败处理，
+      严禁默认当作成功——否则未完成判定的轨迹会误入 success_trajectories，污染 IND 经验池。
+
+    背景：旧写法 verdict.get('task_completed', "None") == "None" 只能拦住"键缺失"的情况；
+    若 LLM 输出 JSON null（解析为 Python None），会绕过该校验，并因 "None is False"
+    不成立而落入 success 分支，导致完成状态不明的轨迹被当作成功。
+    """
+    if not isinstance(verdict, dict):
+        return None, f"verdict 结构异常（类型: {type(verdict).__name__}）"
+
+    task_completed = verdict.get('task_completed')
+
+    if isinstance(task_completed, bool):
+        return task_completed, None
+
+    # 非布尔时尝试从 completion_status 文本兜底恢复，
+    # 避免 LLM 漏输出布尔字段导致整批轨迹直接报废
+    status_text = str(verdict.get('completion_status', '')).strip().lower()
+    if status_text == 'completed':
+        return True, None
+    if status_text == 'failed':
+        return False, None
+    if status_text == 'uncertain':
+        # LLM 明确判定"无法确定完成状态"：合法结果但不可用于 IND/OOD 分流
+        return None, "verdict 判定为 uncertain，完成状态无法确定"
+
+    return None, f"verdict 缺少合法的 task_completed 布尔值（实际值: {task_completed!r}）"
+
+
 def build_batch_verdict_prompt(trajectories: t.List[t.Dict[str, str]]) -> str:
     """
     构建用于批量轨迹判定的 Prompt。

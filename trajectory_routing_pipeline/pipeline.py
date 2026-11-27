@@ -29,7 +29,7 @@ from .instruction_pattern_recognition import (
     build_intent_summary_prompt,
     build_batch_scenario_classify_prompt, build_batch_intent_recognition_prompt
 )
-from .verdict import build_trajectory_text, build_batch_verdict_prompt
+from .verdict import build_trajectory_text, build_batch_verdict_prompt, resolve_task_completed
 
 LOG_FILE = "run.log"
 MAX_LLM_CONCURRENCY = 6
@@ -1281,11 +1281,16 @@ class TrajectoryRoutingPipeline:
                     session_id = traj.get("sessionid", "unknown")
                     verdict = traj.get('verdict', {})
 
-                    if not verdict or verdict.get('task_completed', "None") == "None":
+                    # 显式三态判定：task_completed 只信任真正的布尔值，无法确定时按
+                    # 解析失败处理，严禁默认当作成功（详见 resolve_task_completed 注释）
+                    task_completed, invalid_reason = resolve_task_completed(verdict)
+
+                    if invalid_reason is not None:
+                        traj["verdict_invalid_reason"] = invalid_reason
                         await write_queue.put(("parse_failed", traj))
                         continue
 
-                    if verdict.get('task_completed') is False:
+                    if task_completed is False:
                         failure_traj = await self._process_ood_trajectory(traj)
                         await write_queue.put(("failure", failure_traj))
                     else:
