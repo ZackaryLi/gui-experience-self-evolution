@@ -173,21 +173,22 @@ def get_sorted_steps(trajectory: t.Dict[str, t.Any]) -> t.List[t.Dict[str, t.Any
 
 def build_trajectory_text(
         trajectory: t.Dict[str, t.Any],
-        max_steps: int = 80
+        max_steps: int = 80,
+        head_keep_steps: int = 20
 ) -> str:
     app = trajectory.get("app", "")
     instruction = trajectory.get("instruction", "")
     steps = get_sorted_steps(trajectory)
 
-    lines = [
+    header_lines = [
         f"app: {app}",
         f"instruction: {instruction}",
         "",
         "轨迹如下："
     ]
 
-    valid_step_count = 0
-
+    # 1. 先格式化所有非空步骤
+    blocks: t.List[t.Tuple[int, str]] = []
     for step in steps:
         action = str(step.get("action", "")).strip()
         thought = str(step.get("thought", "")).strip()
@@ -199,13 +200,8 @@ def build_trajectory_text(
         if not action and not thought and not action_purpose:
             continue
 
-        valid_step_count += 1
-        if max_steps is not None and valid_step_count > max_steps:
-            break
-
         step_num = step["step_num"]
-
-        lines.append(
+        blocks.append((step_num, (
             f"""
             [step{step_num}]
             manager_action={manager_action}
@@ -213,7 +209,26 @@ def build_trajectory_text(
             action={action}
             role={role}
             """.strip()
+        )))
+
+    # 2. 超长轨迹保留头部摘要 + 完整尾部。任务完成与否由最终状态决定（是否点了
+    #    最终确认按钮、停在哪个页面），旧实现固定保留前 max_steps 步、丢弃尾部，
+    #    恰好把对判定最关键的收尾步骤截掉，导致长轨迹（往往是最有诊断价值的
+    #    失败轨迹）的 verdict 质量系统性偏低。
+    if max_steps is not None and len(blocks) > max_steps:
+        n_head = max(0, min(head_keep_steps, max_steps))
+        n_tail = max(0, max_steps - n_head)
+        head_blocks = blocks[:n_head]
+        tail_blocks = blocks[len(blocks) - n_tail:] if n_tail > 0 else []
+        omitted = len(blocks) - len(head_blocks) - len(tail_blocks)
+
+        body_parts = [b[1] for b in head_blocks]
+        body_parts.append(
+            f"[中间省略 {omitted} 步：为保证完成度判定的准确性，已保留前 {len(head_blocks)} 步"
+            f"与最后 {len(tail_blocks)} 步的完整执行记录，任务最终状态在尾部步骤中]"
         )
+        body_parts.extend(b[1] for b in tail_blocks)
+    else:
+        body_parts = [b[1] for b in blocks]
 
-
-    return "\n\n".join(lines)
+    return "\n\n".join(header_lines + body_parts)

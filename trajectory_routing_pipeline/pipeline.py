@@ -1,6 +1,7 @@
 import json
 import re
 import os
+import sys
 import uuid
 import typing as t
 import asyncio
@@ -29,7 +30,7 @@ from .instruction_pattern_recognition import (
     build_intent_summary_prompt,
     build_batch_scenario_classify_prompt, build_batch_intent_recognition_prompt
 )
-from .verdict import build_trajectory_text, build_batch_verdict_prompt, resolve_task_completed
+from .verdict import build_trajectory_text, build_batch_verdict_prompt, resolve_task_completed, get_sorted_steps
 
 LOG_FILE = "run.log"
 MAX_LLM_CONCURRENCY = 6
@@ -205,6 +206,9 @@ class TrajectoryRoutingPipeline:
         self.ineffective_plan_recall_trajectories_path = self.save_path / "ineffective_plan_recall_trajectories.jsonl"
         self.rejection_trajectories_path = self.save_path / "rejected_trajectories.jsonl"
         self.parse_failed_trajectories_path = self.save_path / "parse_failed_trajectories.jsonl"
+        # Verdict LLM 基础设施失败（网络重试耗尽等）的轨迹：与业务解析失败分开归档，
+        # 且【刻意不加入】断点续跑扫描集合——下次运行会自动重新判定这批轨迹
+        self.verdict_llm_failed_trajectories_path = self.save_path / "verdict_llm_failed_trajectories.jsonl"
 
         self.routed_trajectories_path = self.save_path / "routed_trajectories.jsonl"
         self.visualization_cache_path = self.save_path / "clustering_visualization.json"
@@ -308,17 +312,30 @@ class TrajectoryRoutingPipeline:
 
     def log(self, msg: str):
         if self.log_file:
-            try:
-                # 获取当前时间，格式化为: YYYY-MM-DD HH:MM:SS
-                current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                # 组合成带有时间戳的日志格式
-                log_msg = f"[{current_time}] {msg}\n"
-                print(log_msg)
+            # 获取当前时间，格式化为: YYYY-MM-DD HH:MM:SS
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # 组合成带有时间戳的日志格式
+            log_msg = f"[{current_time}] {msg}\n"
 
+            # 1. 先写文件（UTF-8，不受控制台编码影响）。
+            #    Windows 控制台默认 GBK，✅⚠️❌ 等 emoji 会让 print 抛 UnicodeEncodeError；
+            #    旧实现把 print 与 write 放在同一个 try 里，print 一失败整条日志
+            #    （含真实业务信息）就完全不落盘，因此两者必须分别独立保护。
+            try:
                 with open(self.log_file, "a", encoding="utf-8") as f:
                     f.write(log_msg)
             except Exception as e:
                 print(f"[日志写入失败] {e}")
+
+            # 2. 再打印到控制台，单独捕获编码异常并降级为可表示字符，保证信息可见
+            try:
+                print(log_msg)
+            except UnicodeEncodeError:
+                try:
+                    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+                    print(log_msg.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+                except Exception:
+                    pass
 
     @staticmethod
     def load_json_data(file_path: str):
@@ -347,21 +364,12 @@ class TrajectoryRoutingPipeline:
         # 匹配 "click([" 开头，"])" 结尾的最短内容
         click_pattern = re.compile(r'click\(\[.*?\]\)')
 
-        # 1. 筛选出所有以 "step" 开头的键 (例如 "step1", "step2")
-        step_keys = [k for k in trajectory.keys() if isinstance(k, str) and k.startswith("step")]
-
-        # 2. 按照步骤编号进行排序，确保按照先后顺序遍历
-        try:
-            step_keys.sort(key=lambda x: int(x.replace("step", "")))
-        except ValueError:
-            pass
-
-            # 3. 按顺序遍历步骤，统计有效步数
-        for key in step_keys:
-            step_data = trajectory.get(key)
-            if not isinstance(step_data, dict):
-                continue
-
+        # 1. 复用 verdict.get_sorted_steps 统一步骤解析口径：
+        #    仅认 step<数字> 键并按数字大小排序。旧实现自行用 startswith("step") 收集
+        #    再 int() 排序，遇到 stepX 之类脏键会抛 ValueError 且被静默吞掉，
+        #    排序退化为字典序（step10 排在 step2 前），导致本函数与 verdict 侧
+        #    看到的步骤序列不一致。
+        for step_data in get_sorted_steps(trajectory):
             manager_act = step_data.get("manager_action", "")
             act = str(step_data.get("action", "")).strip()
 
@@ -1066,6 +1074,9 @@ class TrajectoryRoutingPipeline:
         # =========================================================================
         # 1. 恢复断点与去重集合
         # =========================================================================
+        # 注意：verdict_llm_failed_trajectories_path 刻意不在扫描列表中——其中的轨迹是
+        # 因 LLM 网络等基础设施临时故障而未判定，属于"待重试"而非"已处理"，
+        # 下次运行输入文件仍包含它们时，会自动重新走 Verdict 判定。
         processed_session_ids = set()
         paths_to_check = [
             self.success_trajectories_path, self.failure_trajectories_path,
@@ -1262,20 +1273,48 @@ class TrajectoryRoutingPipeline:
         # 5. 异步批处理：Verdict 判定 (双层执行正确性)
         # =========================================================================
         t_verdict_start = time.perf_counter()  # <--- 【耗时统计】子计时 3：Verdict 判定开始
+        # Verdict 阶段失败率监控：区分 LLM 基础设施失败（待重试）与业务解析失败
+        verdict_monitor = {
+            "llm_failed_batches": 0,      # 运行内重试后仍失败的批次数
+            "llm_failed_trajs": 0,        # 因基础设施失败未判定的轨迹数
+            "parse_failed_trajs": 0,      # LLM 已响应但输出不合法的轨迹数（业务解析失败）
+            "total_batches": 0,
+        }
         if verdict_candidates:
             verdict_batch_size = 5
 
             async def _trajectory_verdict_process(batch_data: list):
                 t_v_0 = time.perf_counter()
                 # 显式传入 count_usage=self.count_usage 并解包统计
-                res = await self._process_batch_verdict(batch_data, count_usage=self.count_usage)
+                batch_data, batch_usage, llm_failed = await self._process_batch_verdict(
+                    batch_data, count_usage=self.count_usage
+                )
                 self._add_cum_time("stage2_verdict_llm_cum", time.perf_counter() - t_v_0)
+                self._add_usage("stage2_verdict", batch_usage)  # <--- 【Token 统计】累加 Verdict 阶段 Token
+                verdict_monitor["total_batches"] += 1
 
-                if isinstance(res, tuple):
-                    batch_data, batch_usage = res
-                    self._add_usage("stage2_verdict", batch_usage)  # <--- 【Token 统计】累加 Verdict 阶段 Token
-                else:
-                    batch_data = res
+                # 基础设施失败：ainvoke 内部已重试 3 次仍失败，这里再做一次运行内
+                # 批次级重试（应对瞬时抖动）；仍失败则整批转入待重试文件，
+                # 与业务解析失败（parse_failed）严格分流
+                if llm_failed:
+                    self.log(f"⚠️ Verdict LLM 调用失败（{len(batch_data)} 条轨迹），尝试运行内批次重试...")
+                    t_retry_0 = time.perf_counter()
+                    batch_data, batch_usage, llm_failed = await self._process_batch_verdict(
+                        batch_data, count_usage=self.count_usage
+                    )
+                    self._add_cum_time("stage2_verdict_llm_cum", time.perf_counter() - t_retry_0)
+                    self._add_usage("stage2_verdict", batch_usage)
+
+                if llm_failed:
+                    verdict_monitor["llm_failed_batches"] += 1
+                    verdict_monitor["llm_failed_trajs"] += len(batch_data)
+                    self.log(
+                        f"❌ Verdict LLM 重试后仍失败，{len(batch_data)} 条轨迹转入待重试文件 "
+                        f"{self.verdict_llm_failed_trajectories_path.name}（下次运行自动重新判定，不占用断点去重）"
+                    )
+                    for traj in batch_data:
+                        await write_queue.put(("verdict_llm_failed", traj))
+                    return
 
                 for traj in batch_data:
                     session_id = traj.get("sessionid", "unknown")
@@ -1287,6 +1326,7 @@ class TrajectoryRoutingPipeline:
 
                     if invalid_reason is not None:
                         traj["verdict_invalid_reason"] = invalid_reason
+                        verdict_monitor["parse_failed_trajs"] += 1
                         await write_queue.put(("parse_failed", traj))
                         continue
 
@@ -1307,6 +1347,14 @@ class TrajectoryRoutingPipeline:
             for task in tqdm(asyncio.as_completed(verdict_tasks), total=len(verdict_tasks), desc="Phase 2.2: Verdict",
                              unit="batch"):
                 await task
+
+        # Verdict 阶段失败率监控汇总
+        self.log(
+            f"📊 Verdict 阶段监控 -> 总批次: {verdict_monitor['total_batches']} | "
+            f"LLM 基础设施失败批次: {verdict_monitor['llm_failed_batches']}"
+            f"（轨迹 {verdict_monitor['llm_failed_trajs']} 条，待下次运行重试）| "
+            f"业务解析失败: {verdict_monitor['parse_failed_trajs']} 条"
+        )
 
         # =========================================================================
         # 6. 收尾：等待队列清空并安全关闭写入协程
@@ -1424,14 +1472,22 @@ class TrajectoryRoutingPipeline:
         # 显式接收 (content, usage) 二元组
         res_verdict = await self.llm.ainvoke(prompt_verdict, count_usage=count_usage)
 
+        llm_failed = False
         if isinstance(res_verdict, tuple):
             res_verdict, verdict_usage = res_verdict
             if token_usage is not None and isinstance(verdict_usage, dict):
                 token_usage["total_tokens"] += (verdict_usage.get("total_tokens") or 0)
                 token_usage["completion_tokens"] += (verdict_usage.get("completion_tokens") or 0)
 
+        # 【基础设施失败判定】ainvoke 在网络重试耗尽等情况下返回 None：
+        # 此时整个 batch 没有任何一条轨迹带上 verdict，属于基础设施故障而非业务解析
+        # 失败，必须由调用方转入待重试文件，严禁与 parse_failed 混写导致断点机制
+        # 把这批轨迹永久标记为"已处理"、从此不再重判。
+        if res_verdict is None:
+            llm_failed = True
+
         # 2. 解析返回的 JSON List，直接利用短 ID 映射写回原数据
-        parsed_result = extract_json(res_verdict)
+        parsed_result = [] if llm_failed else extract_json(res_verdict)
 
         if isinstance(parsed_result, dict):
             if not parsed_result:
@@ -1447,8 +1503,8 @@ class TrajectoryRoutingPipeline:
                 short_id_to_traj[short_id]['verdict'] = item
 
         if count_usage:
-            return batch_data, token_usage
-        return batch_data
+            return batch_data, token_usage, llm_failed
+        return batch_data, None, llm_failed
 
     @staticmethod
     def plan_effectiveness_detection(
@@ -1746,6 +1802,10 @@ class TrajectoryRoutingPipeline:
                     path = self.rejection_trajectories_path
                 elif data_type == "parse_failed":
                     path = self.parse_failed_trajectories_path
+                elif data_type == "verdict_llm_failed":
+                    # LLM 基础设施失败的待重试轨迹：该文件不进断点扫描集合，
+                    # 下次运行输入数据仍在时会被自动重新判定
+                    path = self.verdict_llm_failed_trajectories_path
                 else:
                     path = None
 
