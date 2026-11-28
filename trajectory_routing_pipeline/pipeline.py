@@ -29,7 +29,8 @@ from .llm import extract_json, LLMAgent
 from .instruction_pattern_recognition import (
     build_intent_summary_prompt,
     build_batch_scenario_classify_prompt, build_batch_intent_recognition_prompt,
-    build_cluster_merge_verdict_prompt
+    build_cluster_merge_verdict_prompt,
+    parse_task_card_response
 )
 from .verdict import build_trajectory_text, build_batch_verdict_prompt, resolve_task_completed, get_sorted_steps
 from .intent_gating import BandedGatingConfig, gate_cluster_pair, merge_gated_clusters
@@ -1004,6 +1005,8 @@ class TrajectoryRoutingPipeline:
         t_naming_start = time.perf_counter()
         task_args = []
         summary_dict = defaultdict(lambda: defaultdict(dict))
+        # 任务卡元信息（方案 3.5）：(scenario, app, c_id) -> {scope, exclusions}
+        cluster_card_meta: t.Dict[tuple, dict] = {}
 
         for scenario, apps in grouped_data.items():
             for app, items in apps.items():
@@ -1039,7 +1042,14 @@ class TrajectoryRoutingPipeline:
                         continue
 
                     intents_str = "\n".join([f"- {txt}" for txt in unique_sampled])
-                    prompt = build_intent_summary_prompt(intents_str)
+                    # 任务卡命名（方案 3.5）：intent 短语之外补充原始 instruction 采样
+                    # ——簇内混任务时短语已被抽象压平，原始指令是保真依据
+                    instruction_samples = list(dict.fromkeys(
+                        (it['item'].get('instruction') or '').strip()
+                        for it in group_items
+                        if (it['item'].get('instruction') or '').strip()
+                    ))[:8]
+                    prompt = build_intent_summary_prompt(intents_str, instruction_samples)
                     task_args.append(((scenario, app, c_id), prompt))
 
         if task_args:
@@ -1065,11 +1075,26 @@ class TrajectoryRoutingPipeline:
                 llm_tasks = [run_and_update(meta, prompt, pbar) for meta, prompt in task_args]
                 results = await asyncio.gather(*llm_tasks)
 
+            # 任务卡解析（方案 3.5）：name/scope/exclusions 三字段；
+            # 解析失败回退旧行为（首行清洗为纯名称），保证命名环节不因
+            # 新输出格式而让簇名缺失
             for meta, res in zip([t[0] for t in task_args], results):
                 scenario, app, c_id = meta
                 if isinstance(res, Exception) or not res or not isinstance(res, str):
                     summary_dict[scenario][app][c_id] = f"类别 {c_id}"
+                    continue
+
+                card = parse_task_card_response(res)
+                if card is not None:
+                    summary_dict[scenario][app][c_id] = card["name"]
+                    # scope/exclusions 附加到簇元信息，随轻量缓存落盘，
+                    # 供 3.4 裁决参考 / 下游经验生成划界 / Plan Recall 过滤
+                    cluster_card_meta[(scenario, app, c_id)] = {
+                        "scope": card["scope"],
+                        "exclusions": card["exclusions"],
+                    }
                 else:
+                    # 回退：按纯文本名称清洗（兼容 LLM 未按 JSON 输出的场景）
                     clean_name = res.strip().replace('"', '').replace("'", "").splitlines()[0].strip()
                     summary_dict[scenario][app][c_id] = clean_name if clean_name else f"类别 {c_id}"
 
@@ -1266,6 +1291,11 @@ class TrajectoryRoutingPipeline:
                         new_c_id = global_cluster_id_map[scenario][app].get(old_c_id, old_c_id)
                         item['cluster_label'] = int(new_c_id)
                         item['intent_cluster_name'] = summary_dict[scenario][app].get(new_c_id, f"类别 {new_c_id}")
+                        # 任务卡元信息随簇标签回写（方案 3.5）：合并后的簇继承主簇的任务卡
+                        card = cluster_card_meta.get((scenario, app, new_c_id))
+                        if card:
+                            item["cluster_scope"] = card["scope"]
+                            item["cluster_exclusions"] = card["exclusions"]
 
         # 7. 将不含 intent_embedding 的轻量级结果写入 global_intent_cache.jsonl
         self.log(f"正在写入轻量级全局意图聚类结果文件: {self.global_intent_cache_path}")

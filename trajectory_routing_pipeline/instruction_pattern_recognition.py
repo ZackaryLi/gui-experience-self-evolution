@@ -563,25 +563,86 @@ def build_intent_summary_prompt_backup(intents_str: str):
 意图列表：
 {intents_str}"""
 
-def build_intent_summary_prompt(intents_str: str):
+def build_intent_summary_prompt(intents_str: str, instruction_samples: t.Optional[t.List[str]] = None):
+    """任务卡式簇命名（方案 3.5）：name + scope + exclusions 三字段输出。
+
+    输入在 intent 短语之外补充原始 instruction 样本——簇内混任务时
+    intent 短语已被抽象压平，原始指令是 LLM 判断"这个簇到底在做什么"的
+    保真依据。exclusions（排他边界）一举三得：辅助 3.4 合并裁决、
+    给下游经验生成划定适用域、给 Plan Recall 提供召回过滤条件。
+    """
+    samples_block = ""
+    if instruction_samples:
+        lines = "\n".join(f"- {x}" for x in instruction_samples)
+        samples_block = f"""
+# 原始用户指令采样（比意图短语更保真，命名时以此为准）：
+{lines}
+"""
+
     return f"""
 # 角色定义
-你是一个高级业务意图分类与命名专家。以下是属于同一个聚类簇内的几个代表性意图描述。
+你是一个高级业务意图分类与命名专家。以下是属于同一个聚类簇内的代表性意图描述与原始指令采样。
 
 # 任务目标
-你的任务是：为这个聚类簇提取一个高度凝练且保留核心区分特征的标准意图名称。
+你的任务是：为这个聚类簇生成一张**任务卡**——一个标准名称、一句适用范围、一条排他边界。
 
 # 严格命名规范与 C9 防范（防过度泛化）
-1. **结构要求**：遵循 `[核心动词] + [关键特征修饰(可选)] + [核心客体/页面]` 的结构。
+1. **结构要求**：name 遵循 `[核心动词] + [关键特征修饰(可选)] + [核心客体/页面]` 的结构。
 2. **保留特异性特征（核心法则/防 C9 过宽）**：
-   - 绝不能过度向上抽象！如果输入样本中包含高度一致的特异性诉求（例如：“评价”、“规格参数”、“官方/旗舰店验证”、“退款进度”、“更换头像”等），必须将这些特征词完整保留在命名中。
+   - 绝不能过度向上抽象！如果输入样本中包含高度一致的特异性诉求（例如：“评价”、“规格参数”、“退款进度”、“更换头像”等），必须将这些特征词完整保留在命名中。
    - 禁止使用过于笼统、会混入其他不同操作路径的宽泛名称（如将“查退款进度”命名为“售后服务”，将“更换头像”命名为“管理账户”）。
-3. **排噪要求**：必须剥离具体的 App 名称（如淘宝、抖音、微信等）、时间状语（如今天、每日）、平台任务术语以及无意义的口语。
-4. **输出限制**：必须且只能输出这一个标准化名称，字数控制在 4 到 14 个字之间。绝对不要输出标点符号、解释说明或其他多余文字。
+3. **排噪要求**：剥离具体的 App 名称（如淘宝、抖音、微信等）、时间状语（如今天、每日）、平台任务术语以及无意义的口语。
+4. **输出限制**：必须只输出一个合法 JSON 对象，不要 markdown 标记、不要解释文字。
 
-# 输入样本：
+# 输出格式
+{{
+  "name": "标准化意图名称，4 到 14 个字，不含标点",
+  "scope": "适用范围一句话：本簇任务共性操作路径的描述，不超过 30 字",
+  "exclusions": "排他边界：明确什么近邻任务不属于本簇（如'不含修改个性签名/头像，入口不同'），不超过 30 字"
+}}
+
+# 意图短语样本：
 {intents_str}
+{samples_block}
 """
+
+
+def parse_task_card_response(text: str) -> t.Optional[t.Dict[str, str]]:
+    """解析任务卡命名 LLM 输出为 {{name, scope, exclusions}}。
+
+    宽容解析：合法 JSON 优先；结构切片兜底；name 为空视为失败返回 None。
+    scope/exclusions 缺失降级为空串（name 是唯一硬性字段）。
+    """
+    import json as _json
+
+    if not text or not isinstance(text, str):
+        return None
+
+    candidate = text.strip()
+    # 结构切片：取最外层花括号
+    start, end = candidate.find('{'), candidate.rfind('}')
+    if start != -1 and end > start:
+        candidate = candidate[start:end + 1]
+
+    for attempt_text in (candidate,):
+        try:
+            obj = _json.loads(attempt_text)
+        except _json.JSONDecodeError:
+            try:
+                from json_repair import repair_json
+                obj = repair_json(attempt_text, return_objects=True)
+            except Exception:
+                continue
+        if isinstance(obj, dict):
+            name = str(obj.get("name", "") or "").strip().replace('"', '').replace("'", "")
+            if not name:
+                return None
+            return {
+                "name": name,
+                "scope": str(obj.get("scope", "") or "").strip(),
+                "exclusions": str(obj.get("exclusions", "") or "").strip(),
+            }
+    return None
 
 
 def build_cluster_merge_verdict_prompt(
