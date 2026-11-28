@@ -29,18 +29,19 @@ class _FakeLLM:
 
     def __init__(self):
         # 意图提取响应：两条指令，一条带完整结构化字段，一条 attributes 非法
+        # 注意 target 键名与 prompt 输出格式一致为 specific_target
         self.intent_response = json.dumps([
             {
                 "id": "traj_0",
                 "core_action": "修改",
-                "target": "昵称",
+                "specific_target": "昵称",
                 "attributes": ["相册最新照片"],
                 "core_intent": "修改昵称"
             },
             {
                 "id": "traj_1",
                 "core_action": "修改",
-                "target": "个性签名",
+                "specific_target": "个性签名",
                 "attributes": "非法字段-应为列表",
                 "core_intent": "修改个性签名"
             }

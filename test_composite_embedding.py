@@ -34,10 +34,10 @@ class _FakeLLM:
 
     def __init__(self):
         self.intent_response = json.dumps([
-            {"id": "traj_0", "core_action": "修改", "target": "昵称",
+            {"id": "traj_0", "core_action": "修改", "specific_target": "昵称",
              "attributes": ["张三"], "task_fingerprint": "在个人资料编辑页中修改昵称以更新账号名称",
              "core_intent": "修改昵称"},
-            {"id": "traj_1", "core_action": "签到", "target": "签到任务",
+            {"id": "traj_1", "core_action": "签到", "specific_target": "签到任务",
              "attributes": [], "task_fingerprint": "在会员福利页中执行签到任务以领取奖励",
              "core_intent": "执行签到任务"},
         ], ensure_ascii=False)
