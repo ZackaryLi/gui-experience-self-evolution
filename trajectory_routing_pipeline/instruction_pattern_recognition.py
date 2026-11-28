@@ -473,7 +473,7 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
   {{
     "id": "string (对应的输入ID)",
     "core_action": "string",
-    "target": "string",
+    "specific_target": "string",
     "attributes": ["string", "string"],
     "core_intent": "string"
   }},
@@ -494,29 +494,36 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "id": "ex_1",
         "core_action": "搜索",
         "specific_target": "指定商品",
-        "attributes": ["二手", "便宜"],
+        "attributes": ["按销量排序"],
         "core_intent": "搜索指定商品"
     }},
     {{
         "id": "ex_2",
-        "core_action": "搜索",
-        "specific_target": "指定商品",
-        "attributes": ["苹果15手机壳", "按销量排序"],
-        "core_intent": "搜索指定商品"
+        "core_action": "修改",
+        "specific_target": "个人简介",
+        "attributes": ["热爱生活"],
+        "core_intent": "修改个人简介"
     }},
     {{
         "id": "ex_3",
         "core_action": "修改",
-        "specific_target": "头像",
-        "attributes": ["相册最新照片"],
-        "core_intent": "修改头像"
+        "specific_target": "昵称",
+        "attributes": ["张三"],
+        "core_intent": "修改昵称"
     }},
     {{
         "id": "ex_4",
-        "core_action": "查询",
-        "specific_target": "指定票务",
-        "attributes": ["王菲演唱会门票"],
-        "core_intent": "查询指定票务"
+        "core_action": "执行",
+        "specific_target": "签到任务",
+        "attributes": ["每日签到"],
+        "core_intent": "执行签到任务"
+    }},
+    {{
+        "id": "ex_5",
+        "core_action": "执行",
+        "specific_target": "签到任务",
+        "attributes": ["每日签到"],
+        "core_intent": "执行签到任务"
     }}
 ]
 
