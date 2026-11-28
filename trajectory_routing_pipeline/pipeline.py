@@ -1439,7 +1439,21 @@ class TrajectoryRoutingPipeline:
                 continue
             short_id = item.get('id')
             if short_id in short_id_to_traj:
-                short_id_to_traj[short_id]['intent'] = item.get("core_intent", "")
+                traj_ref = short_id_to_traj[short_id]
+                traj_ref['intent'] = item.get("core_intent", "")
+                # 结构化字段全量落盘：core_action/target/attributes 是区分近邻任务的
+                # 判别信息（如"修改昵称"与"修改个性签名"的差异在 target 字段中），
+                # 旧实现只保留汇总短语 core_intent，判别信号在最后一公里被丢弃，
+                # 导致下游 Embedding 只能基于压平区分度的抽象短语聚类。
+                # 这些字段本就包含在 LLM 输出里，保留它们不增加任何 LLM 成本，
+                # 供后续复合表征 Embedding 使用（详见 INTENT_CLUSTERING_IMPROVEMENT_PLAN.md 3.2）。
+                traj_ref['core_action'] = str(item.get("core_action", "") or "").strip()
+                traj_ref['target'] = str(item.get("target", "") or "").strip()
+                raw_attrs = item.get("attributes")
+                if isinstance(raw_attrs, list):
+                    traj_ref['attributes'] = [str(a).strip() for a in raw_attrs if str(a).strip()]
+                else:
+                    traj_ref['attributes'] = []
 
         if count_usage:
             return batch_data, token_usage
