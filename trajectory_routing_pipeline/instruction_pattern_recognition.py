@@ -462,6 +462,15 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
 - Attributes（约束条件剥离）：
 将所有的修饰词、筛选条件（如：二手、价格排序、品牌官方）全部剥离到此数组中。
 
+- Task Fingerprint（任务指纹，交互路径显式化）：
+基于该任务在手机上的实际点击路径，按固定模板 `在{页面/模块}中{操作}{客体}以{目的}` 生成一行规范短语。
+目的：把"交互路径"从 embedding 的隐式推断变成显式文本——两个任务即使语义相似，只要进入的页面/模块不同，指纹就不同，从而帮助下游区分近邻任务。
+规则：
+1. 不提及具体 App 名称（App 由独立字段承载，指纹保持跨平台一致）；
+2. 页面/模块取执行该任务必经的界面（如"个人资料编辑页"、"电商搜索结果页"），而不是泛称"App内"；
+3. 操作用最基础的标准动词（与 Core Action 同口径），客体的抽象粒度遵循 Specific Target 的两条法则；
+4. 相同任务在不同平台或表述下的指纹必须完全一致（与 Core Intent 的排噪规则相同）。
+
 - Core Intent（标准化意图汇总）：
 基于提取的 Core Action 和 Specific Target 进行高度凝练的汇总。
 汇总规则：必须使用 [Core Action] + [抽象或具体的 Target] 拼接。
@@ -475,6 +484,7 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
     "core_action": "string",
     "specific_target": "string",
     "attributes": ["string", "string"],
+    "task_fingerprint": "string",
     "core_intent": "string"
   }},
   ...
@@ -495,6 +505,7 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "core_action": "搜索",
         "specific_target": "指定商品",
         "attributes": ["按销量排序"],
+        "task_fingerprint": "在电商搜索结果页中搜索指定商品以浏览目标商品",
         "core_intent": "搜索指定商品"
     }},
     {{
@@ -502,6 +513,7 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "core_action": "修改",
         "specific_target": "个人简介",
         "attributes": ["热爱生活"],
+        "task_fingerprint": "在个人资料编辑页中修改个人简介以更新资料信息",
         "core_intent": "修改个人简介"
     }},
     {{
@@ -509,6 +521,7 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "core_action": "修改",
         "specific_target": "昵称",
         "attributes": ["张三"],
+        "task_fingerprint": "在个人资料编辑页中修改昵称以更新账号名称",
         "core_intent": "修改昵称"
     }},
     {{
@@ -516,6 +529,7 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "core_action": "执行",
         "specific_target": "签到任务",
         "attributes": ["每日签到"],
+        "task_fingerprint": "在会员福利页中执行签到任务以领取奖励",
         "core_intent": "执行签到任务"
     }},
     {{
@@ -523,6 +537,7 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "core_action": "执行",
         "specific_target": "签到任务",
         "attributes": ["每日签到"],
+        "task_fingerprint": "在会员福利页中执行签到任务以领取奖励",
         "core_intent": "执行签到任务"
     }}
 ]

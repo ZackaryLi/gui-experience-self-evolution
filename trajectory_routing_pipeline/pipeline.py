@@ -1449,6 +1449,11 @@ class TrajectoryRoutingPipeline:
                 # 供后续复合表征 Embedding 使用（详见 INTENT_CLUSTERING_IMPROVEMENT_PLAN.md 3.2）。
                 traj_ref['core_action'] = str(item.get("core_action", "") or "").strip()
                 traj_ref['target'] = str(item.get("target", "") or "").strip()
+                # 任务指纹：按"在{页面/模块}中{操作}{客体}以{目的}"模板显式描述交互路径，
+                # 把"执行路径相同"从 embedding 的隐式推断变成显式文本——近邻任务
+                # （语义相似但必经页面/入口不同）在指纹文本上可直接区分。
+                # 仍在同一次 LLM 调用内产出，不增加调用次数
+                traj_ref['task_fingerprint'] = str(item.get("task_fingerprint", "") or "").strip()
                 raw_attrs = item.get("attributes")
                 if isinstance(raw_attrs, list):
                     traj_ref['attributes'] = [str(a).strip() for a in raw_attrs if str(a).strip()]
