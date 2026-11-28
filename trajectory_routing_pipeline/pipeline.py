@@ -1722,7 +1722,7 @@ class TrajectoryRoutingPipeline:
                 # 这些字段本就包含在 LLM 输出里，保留它们不增加任何 LLM 成本，
                 # 供后续复合表征 Embedding 使用（详见 INTENT_CLUSTERING_IMPROVEMENT_PLAN.md 3.2）。
                 traj_ref['core_action'] = str(item.get("core_action", "") or "").strip()
-                traj_ref['target'] = str(item.get("target", "") or "").strip()
+                traj_ref['target'] = str(item.get("specific_target", "") or "").strip()
                 # 任务指纹：按"在{页面/模块}中{操作}{客体}以{目的}"模板显式描述交互路径，
                 # 把"执行路径相同"从 embedding 的隐式推断变成显式文本——近邻任务
                 # （语义相似但必经页面/入口不同）在指纹文本上可直接区分。
