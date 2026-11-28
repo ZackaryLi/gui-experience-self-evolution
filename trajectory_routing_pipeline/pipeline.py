@@ -63,6 +63,24 @@ def get_normalized_key(app: str, instruction: str) -> str:
     raw_key = f"{clean_app}#{clean_instr}"
     return hashlib.md5(raw_key.encode('utf-8')).hexdigest()
 
+def build_composite_text(item: dict) -> str:
+    """拼接向量文本（方案 3.2a）：core_action + target + attributes。
+
+    target 里的判别信息（昵称 vs 个性签名）是区分近邻任务的主信号，
+    必须进聚类主度量的向量；attributes 参与文本但不参与分字段门控。
+    旧缓存条目缺结构化字段时回退 core_intent（方案 3.2 旧缓存兼容规则），
+    保证旧数据在新代码下仍可聚类。
+    """
+    action = str(item.get("core_action", "") or "").strip()
+    target = str(item.get("target", "") or "").strip()
+    attrs = item.get("attributes")
+    attr_str = ""
+    if isinstance(attrs, list):
+        attr_str = " ".join(str(a).strip() for a in attrs if str(a).strip())
+    if not (action or target):
+        return str(item.get("intent", "") or "").strip()
+    return f"{action} {target} {attr_str}".strip()
+
 def _process_cluster_worker_backup(local_X):
     """
     分离出的 CPU 密集型任务：聚类与降维
@@ -236,6 +254,13 @@ class TrajectoryRoutingPipeline:
         self.embedding_sem = asyncio.Semaphore(max_embedding_concurrency)
 
         self.count_usage = count_usage
+        # 双用途表征监控（方案 3.2）：结构化字段产出率 / embedding 失败数，
+        # 与 perf_stats 同批刷盘，供观测新表征落地质量
+        self.embedding_field_stats = {
+            "structured_items": 0,          # 分字段向量齐全的条目数
+            "field_missing_items": 0,       # 主向量成功但分字段缺失/维度不符的条目数
+            "embedding_failed_items": 0,    # 主 embedding 失败的条目数（不落有效向量，下次重试）
+        }
         self.perf_stats = {
             # 1. Token 消耗统计
             "token_usage": {
@@ -297,7 +322,10 @@ class TrajectoryRoutingPipeline:
         try:
             report_file = self.save_path / "perf_and_token_report.json"
             report_file.parent.mkdir(parents=True, exist_ok=True)
-            report_str = json.dumps(self.perf_stats, ensure_ascii=False, indent=2)
+            report_payload = dict(self.perf_stats)
+            # 附加双用途表征监控（方案 3.2），与性能统计同盘输出
+            report_payload["embedding_field_stats"] = dict(self.embedding_field_stats)
+            report_str = json.dumps(report_payload, ensure_ascii=False, indent=2)
             with open(report_file, "w", encoding="utf-8") as f_rep:
                 f_rep.write(report_str)
         except Exception as e:
@@ -715,26 +743,53 @@ class TrajectoryRoutingPipeline:
                     batch_inputs, batch_usage = res
                     self._add_usage("stage1_classify_and_intent", batch_usage)
 
-                intents_to_embed = []
                 for idx, item in enumerate(sub_items):
                     extracted = batch_inputs[idx]
-                    intent_text = extracted.get("intent", "")
-                    category_info = extracted.get("category", {})
+                    item["intent"] = extracted.get("intent", "")
+                    item["category"] = extracted.get("category", {})
 
-                    item["intent"] = intent_text
-                    item["category"] = category_info
-                    intents_to_embed.append(intent_text)
+                # 3.2 双用途 Embedding（方案 3.2）：拼接向量 = 聚类主度量，
+                # 分字段向量（target/action）= 门控判据。三种文本段拼成一次
+                # 批量请求编码后按索引段拆分，调用量不变
+                composite_texts, target_texts, action_texts = [], [], []
+                for item in sub_items:
+                    composite_texts.append(build_composite_text(item))
+                    target = str(item.get("target", "") or "").strip()
+                    action = str(item.get("core_action", "") or "").strip()
+                    # 空字段以单空格占位（与 _intent_embedding 的空值防御一致），
+                    # 拆分后长度为 0/空白文本的向量按空值处理，不参与门控
+                    target_texts.append(target if target else " ")
+                    action_texts.append(action if action else " ")
 
-                # 3.2 立即对该 Batch 进行 Embedding（带计时）
                 t_emb_0 = time.perf_counter()
-                embeddings = await self._intent_embedding(intents_to_embed)
+                merged_texts = composite_texts + target_texts + action_texts
+                merged_embeddings = await self._intent_embedding(merged_texts)
                 self._add_cum_time("stage1_intent_embedding_cum", time.perf_counter() - t_emb_0)
 
+                n = len(sub_items)
+                composite_embs = merged_embeddings[0:n] if len(merged_embeddings) >= n else []
+                target_embs = merged_embeddings[n:2 * n] if len(merged_embeddings) >= 2 * n else []
+                action_embs = merged_embeddings[2 * n:3 * n] if len(merged_embeddings) >= 3 * n else []
+
                 for idx, item in enumerate(sub_items):
-                    if embeddings and idx < len(embeddings) and embeddings[idx]:
-                        item["intent_embedding"] = embeddings[idx]
+                    comp_emb = composite_embs[idx] if idx < len(composite_embs) else []
+                    item["intent_embedding"] = comp_emb if comp_emb else []
+                    # 分字段向量落盘供 3.3 门控使用；主向量失败的条目分字段向量一并置空
+                    if comp_emb:
+                        t_emb = target_embs[idx] if idx < len(target_embs) else []
+                        a_emb = action_embs[idx] if idx < len(action_embs) else []
+                        item["target_embedding"] = t_emb if t_emb and len(t_emb) == len(comp_emb) else []
+                        item["action_embedding"] = a_emb if a_emb and len(a_emb) == len(comp_emb) else []
+                        if item["target_embedding"] and item["action_embedding"]:
+                            self.embedding_field_stats["structured_items"] += 1
+                        else:
+                            self.embedding_field_stats["field_missing_items"] += 1
                     else:
-                        item["intent_embedding"] = []
+                        # embedding 失败的条目不产出任何向量（包括占位空列表），
+                        # 下次运行缓存未命中可自动重试（S1-P0 的防污染语义）
+                        item["target_embedding"] = []
+                        item["action_embedding"] = []
+                        self.embedding_field_stats["embedding_failed_items"] += 1
 
                 # 3.3 将处理完毕的整个 Batch 放入队列
                 await intent_write_queue.put(sub_items)
