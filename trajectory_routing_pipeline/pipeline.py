@@ -791,6 +791,10 @@ class TrajectoryRoutingPipeline:
             item["target"] = extracted.get("target", "")
             item["attributes"] = extracted.get("attributes", [])
             item["task_fingerprint"] = extracted.get("task_fingerprint", "")
+            # 复合任务标记（方案 A）：回写 is_compound/sub_intents，
+            # 供 3.3 门控绕过自动合并（复合-非复合对转 LLM 裁决）
+            item["is_compound"] = extracted.get("is_compound", False)
+            item["sub_intents"] = extracted.get("sub_intents", [])
 
         # 3. 双用途 Embedding（方案 3.2）：拼接向量 = 聚类主度量，
         # 分字段向量（target/action）= 门控判据。三种文本段拼成一次
@@ -1006,11 +1010,18 @@ class TrajectoryRoutingPipeline:
                     local_field_ok = bool(np.all(field_vector_map[g_indices]))
                     local_target_in = local_target if local_field_ok else None
                     local_action_in = local_action if local_field_ok else None
+                    # 复合任务标记（方案 B）：按 global_index 对齐构造布尔数组，
+                    # 复合-非复合混合簇对全档位不自动合并、转 LLM 裁决
+                    local_compound = np.array(
+                        [bool(it['item'].get('is_compound')) for it in valid_items],
+                        dtype=bool,
+                    )
 
                     new_labels, decisions = merge_gated_clusters(
                         gate_config, labels, local_X,
                         local_target_in, local_action_in,
                         cluster_monitor=gate_monitor_total,
+                        compound_flags=local_compound,
                     )
                     if decisions:
                         merged_pairs = sum(1 for d in decisions if d["merge"])
@@ -1153,8 +1164,13 @@ class TrajectoryRoutingPipeline:
 
         # 5.2 构建候选簇对：同桶内簇中心相似度落在候选带的才需要裁决
         # （免检对已在门控阶段直接合并；过远对不必裁决——与方案 3.4 候选带一致）
+        # 例外（方案 B）：复合-非复合的混合簇对被门控全档位拦截（compound_deferred），
+        # 它们的中心相似度可能很高（复合与简单指令的 target/action 全同）——这类对
+        # 无论相似度落在哪一档，都必须进入 LLM 裁决，否则会被两个机制同时拒绝、
+        # 永远无人判定
         candidate_band_low, candidate_band_high = 0.75, 0.88
         merge_verdict_tasks = []
+        compound_pair_count = 0
         for scenario, apps in grouped_data.items():
             for app, items in apps.items():
                 cluster_groups = defaultdict(list)
@@ -1177,16 +1193,29 @@ class TrajectoryRoutingPipeline:
                     return c / n if n > 0 else c
 
                 centers = {cid: _center_of(cid) for cid in c_ids}
+                # 簇级复合性（与 intent_gating 同口径：任一成员复合即整簇从严）
+                compound_by_cid = {
+                    cid: any(bool(it['item'].get('is_compound')) for it in members)
+                    for cid, members in cluster_groups.items()
+                }
                 for x in range(len(c_ids)):
                     for y in range(x + 1, len(c_ids)):
                         ca, cb = centers[c_ids[x]], centers[c_ids[y]]
                         denom = float(np.linalg.norm(ca) * np.linalg.norm(cb))
                         sim = float(np.dot(ca, cb) / denom) if denom > 0 else 0.0
-                        if candidate_band_low <= sim <= candidate_band_high:
+                        is_compound_pair = (compound_by_cid[c_ids[x]] != compound_by_cid[c_ids[y]])
+                        if is_compound_pair:
+                            # 复合混合对：不受候选带限制，必进 LLM 裁决
+                            compound_pair_count += 1
+                            merge_verdict_tasks.append((scenario, app, c_ids[x], c_ids[y],
+                                                        cluster_groups[c_ids[x]], cluster_groups[c_ids[y]], sim))
+                        elif candidate_band_low <= sim <= candidate_band_high:
                             merge_verdict_tasks.append((scenario, app, c_ids[x], c_ids[y],
                                                         cluster_groups[c_ids[x]], cluster_groups[c_ids[y]], sim))
 
-        self.log(f"共 {len(merge_verdict_tasks)} 个候选簇对进入 LLM 合并裁决（候选带 [{candidate_band_low}, {candidate_band_high}]）")
+        self.log(f"共 {len(merge_verdict_tasks)} 个候选簇对进入 LLM 合并裁决"
+                 f"（候选带 [{candidate_band_low}, {candidate_band_high}]，"
+                 f"其中复合混合对 {compound_pair_count} 个不受候选带限制）")
 
         # 5.3 逐对裁决（带缓存命中与一次重试；LLM 失败的对保持分裂，宁分不合）
         merge_failed_keys = []
@@ -1728,6 +1757,19 @@ class TrajectoryRoutingPipeline:
                 # （语义相似但必经页面/入口不同）在指纹文本上可直接区分。
                 # 仍在同一次 LLM 调用内产出，不增加调用次数
                 traj_ref['task_fingerprint'] = str(item.get("task_fingerprint", "") or "").strip()
+                # 复合任务标记（方案 A）：复合指令（如"打卡后切账号再打卡"）的
+                # target/action 与简单指令完全相同，门控会错误放行合并——
+                # is_compound/sub_intents 让下游门控与聚类显式感知复合性
+                is_compound = item.get("is_compound")
+                traj_ref['is_compound'] = bool(is_compound) if isinstance(is_compound, bool) else False
+                raw_sub_intents = item.get("sub_intents")
+                if isinstance(raw_sub_intents, list):
+                    traj_ref['sub_intents'] = [str(s).strip() for s in raw_sub_intents if str(s).strip()]
+                else:
+                    traj_ref['sub_intents'] = []
+                # 非复合但 LLM 却给了 sub_intents：以 is_compound 为准清空
+                if not traj_ref['is_compound']:
+                    traj_ref['sub_intents'] = []
                 raw_attrs = item.get("attributes")
                 if isinstance(raw_attrs, list):
                     traj_ref['attributes'] = [str(a).strip() for a in raw_attrs if str(a).strip()]
@@ -2244,7 +2286,7 @@ class TrajectoryRoutingPipeline:
         """
         两阶段解耦管线总入口
         """
-        if isinstance(input_file_path, str):
+        if isinstance(input_file_path, str) or isinstance(input_file_path, Path):
             input_file_path = [input_file_path]
 
         async def _run_all():

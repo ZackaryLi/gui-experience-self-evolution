@@ -41,7 +41,8 @@ class BandedGatingConfig:
 class GateVerdict:
     """单个簇对的门控裁决结果"""
     allowed: bool                  # 是否允许合并
-    band: str                      # "free_pass" / "free_block" / "gated_pass" / "gated_block" / "gated_error"
+    band: str                      # "free_pass" / "free_block" / "gated_pass" / "gated_block" /
+                                  # "gated_error" / "compound_deferred"
     center_sim: float              # 簇中心余弦相似度
     checked_pairs: int = 0         # 实际检查的跨簇样本对数
     failed_pair_index: t.Tuple[int, int] = None  # 首个未通过门控的样本对（簇内相对索引）
@@ -82,15 +83,30 @@ def gate_cluster_pair(
         composite_a: np.ndarray, composite_b: np.ndarray,
         target_a: t.Optional[np.ndarray], target_b: t.Optional[np.ndarray],
         action_a: t.Optional[np.ndarray], action_b: t.Optional[np.ndarray],
+        compound_a: bool = False, compound_b: bool = False,
 ) -> GateVerdict:
     """对一对簇执行三档分流与 AND 门控。
 
     入参为两簇的成员向量矩阵（行=成员）。composite 为主度量（拼接向量），
     target/action 为分字段向量；分字段向量缺失（旧缓存/空值）时灰度带内
     降级为拒绝合并（宁分不合），并标记 gated_error。
+
+    复合任务防线（方案 B）：复合指令（如"打卡后切账号再打卡"）的 target/
+    action 与简单指令完全相同，门控与 free_pass 档都会错误放行合并。
+    因此"复合-非复合"的混合簇对【全档位】不自动合并（含 free_pass），
+    标记 compound_deferred 转交 LLM 裁决——裁决看原始指令能分对，
+    宁分不合原则补上门控的假设盲区。复合-复合对不受影响（正常分流）。
     """
     if len(composite_a) == 0 or len(composite_b) == 0:
         return GateVerdict(False, "free_block", 0.0)
+
+    # 混合复合性簇对：门控不自动合并（全档位拦截，含免检档）
+    if compound_a != compound_b:
+        center_a = _center_vector(np.atleast_2d(composite_a))
+        center_b = _center_vector(np.atleast_2d(composite_b))
+        denom = float(np.linalg.norm(center_a) * np.linalg.norm(center_b))
+        sim = float(np.dot(center_a, center_b) / denom) if denom > 0 else 0.0
+        return GateVerdict(False, "compound_deferred", round(sim, 6))
 
     center_a = _center_vector(np.atleast_2d(composite_a))
     center_b = _center_vector(np.atleast_2d(composite_b))
@@ -141,16 +157,21 @@ def merge_gated_clusters(
         target_X: t.Optional[np.ndarray],
         action_X: t.Optional[np.ndarray],
         cluster_monitor: t.Optional[dict] = None,
+        compound_flags: t.Optional[np.ndarray] = None,
 ) -> t.Tuple[np.ndarray, t.List[dict]]:
     """对过分割聚类结果执行门控驱动的簇对合并（方案 3.3(c) 两步近似）。
 
     labels: 聚类标签（-1 噪声不参与）；composite_X: 全量拼接向量（行序与 labels 一致）；
-    target_X/action_X: 全量分字段向量（可为 None，灰度带内全部按宁分不合处理）。
+    target_X/action_X: 全量分字段向量（可为 None，灰度带内全部按宁分不合处理）；
+    compound_flags: 每条样本的复合任务标记（行序与 labels 一致，可为 None
+    ——缺失时视为全非复合，兼容旧缓存）。簇的复合性 = 簇内任一成员为复合
+    （复合条目混进简单簇本身就是待裁决信号，从严标记）。
     返回 (新标签, 裁决记录列表)。
 
     合并规则：只合并"过分割本应同簇"的对——即两簇中心相似度落在
-    [s_low 之上] 且通过门控（free_pass 或 gated_pass）。合并按中心相似度
-    从高到低贪心执行，已合并的簇不重复参与（避免链式漂移：
+    [s_low 之上] 且通过门控（free_pass 或 gated_pass）。复合-非复合的
+    混合对全档位不自动合并（compound_deferred，转 LLM 裁决）。合并按
+    中心相似度从高到低贪心执行，已合并的簇不重复参与（避免链式漂移：
     每次 union 只发生在门控对直接验证过的簇对之间）。
     """
     labels = np.asarray(labels)
@@ -166,6 +187,13 @@ def merge_gated_clusters(
     tgt_mats = {cid: (np.atleast_2d(target_X[members[cid]]) if target_X is not None and len(members[cid]) else None) for cid in unique_ids}
     act_mats = {cid: (np.atleast_2d(action_X[members[cid]]) if action_X is not None and len(members[cid]) else None) for cid in unique_ids}
 
+    # 簇级复合性标记：簇内任一成员复合即整簇从严标记
+    cluster_compound: t.Dict[int, bool] = {cid: False for cid in unique_ids}
+    if compound_flags is not None:
+        flags = np.asarray(compound_flags, dtype=bool)
+        for cid in unique_ids:
+            cluster_compound[cid] = bool(np.any(flags[members[cid]]))
+
     # 候选簇对：全部两两过 gate（桶内簇数有限，O(k²) 可控）
     verdicts: t.List[tuple] = []
     for x in range(len(unique_ids)):
@@ -175,6 +203,8 @@ def merge_gated_clusters(
                 config, comp_mats[cid_a], comp_mats[cid_b],
                 tgt_mats[cid_a], tgt_mats[cid_b],
                 act_mats[cid_a], act_mats[cid_b],
+                compound_a=cluster_compound[cid_a],
+                compound_b=cluster_compound[cid_b],
             )
             verdicts.append((cid_a, cid_b, v))
 
@@ -185,12 +215,14 @@ def merge_gated_clusters(
         gated_pass = sum(1 for _, _, v in verdicts if v.band == "gated_pass")
         gated_block = sum(1 for _, _, v in verdicts if v.band == "gated_block")
         gated_error = sum(1 for _, _, v in verdicts if v.band == "gated_error")
+        compound_deferred = sum(1 for _, _, v in verdicts if v.band == "compound_deferred")
         gated_total = gated_pass + gated_block + gated_error
         cluster_monitor.update({
             "gate_free_pass_pairs": free_pass,
             "gate_free_block_pairs": free_block,
             "gate_gated_pass_pairs": gated_pass,
             "gate_gated_block_pairs": gated_block,
+            "gate_compound_deferred_pairs": compound_deferred,
             "gate_gated_error_pairs": gated_error,
             "gate_gated_pass_ratio": round(gated_pass / gated_total, 4) if gated_total else None,
         })

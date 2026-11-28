@@ -106,6 +106,63 @@ class TestGateClusterPair(unittest.TestCase):
         v = gate_cluster_pair(self.config, a, b, None, None, None, None)
         self.assertFalse(v.allowed)
 
+    # ---------- 复合任务防线（方案 B） ----------
+
+    def test_compound_mixed_pair_deferred_even_free_pass(self):
+        """复合-非复合簇对全档位拦截：即使中心相似度达免检档也不自动合并"""
+        a = np.stack([_unit_vec(0.0), _unit_vec(0.01)])
+        b = np.stack([_unit_vec(0.02), _unit_vec(0.03)])  # 相似度 ≥0.93 的免检对
+        v = gate_cluster_pair(self.config, a, b, a, b, a, b,
+                              compound_a=True, compound_b=False)
+        self.assertFalse(v.allowed)
+        self.assertEqual(v.band, "compound_deferred")
+        self.assertGreaterEqual(v.center_sim, self.config.s_high)  # 确认本应免检
+
+    def test_compound_mixed_pair_deferred_in_gray_band(self):
+        """复合-非复合簇对灰度带内同样拦截转裁决"""
+        a = np.stack([_unit_vec(0.0), _unit_vec(0.1)])
+        b = np.stack([_unit_vec(0.5), _unit_vec(0.6)])
+        v = gate_cluster_pair(self.config, a, b, a, b, a, b,
+                              compound_a=False, compound_b=True)
+        self.assertFalse(v.allowed)
+        self.assertEqual(v.band, "compound_deferred")
+
+    def test_compound_compound_pair_uses_normal_gating(self):
+        """复合-复合簇对不受影响：正常走门控（分字段一致即可合并）"""
+        a = np.stack([_unit_vec(0.0), _unit_vec(0.1)])
+        b = np.stack([_unit_vec(0.5), _unit_vec(0.6)])
+        field = np.ones((2, 8), dtype=np.float32)
+        v = gate_cluster_pair(self.config, a, b, field, field, field, field,
+                              compound_a=True, compound_b=True)
+        self.assertEqual(v.band, "gated_pass")
+        self.assertTrue(v.allowed)
+
+    def test_merge_with_compound_flags(self):
+        """merge_gated_clusters 消费 compound_flags：混合对不合并、计入监控"""
+        # C0 含一条复合标记成员，C1 全非复合——即使向量极近也不自动合并
+        comp = np.stack([_unit_vec(0.0), _unit_vec(0.01), _unit_vec(0.02), _unit_vec(0.03)])
+        labels = np.array([0, 0, 1, 1])
+        flags = np.array([False, True, False, False])  # C0 因成员 1 复合而整簇从严
+        monitor = {}
+        new_labels, _ = merge_gated_clusters(
+            self.config, labels, comp, comp, comp,
+            cluster_monitor=monitor, compound_flags=flags)
+        # 保持两簇分裂
+        self.assertEqual(len(set(new_labels.tolist())), 2)
+        self.assertEqual(monitor.get("gate_compound_deferred_pairs"), 1)
+
+    def test_merge_compound_flags_none_backward_compatible(self):
+        """compound_flags 缺失（旧缓存条目）时视为全非复合，行为与旧版一致"""
+        comp = np.stack([_unit_vec(0.0), _unit_vec(0.01), _unit_vec(0.02), _unit_vec(0.03)])
+        labels = np.array([0, 0, 1, 1])
+        monitor = {}
+        new_labels, _ = merge_gated_clusters(
+            self.config, labels, comp, comp, comp, cluster_monitor=monitor,
+            compound_flags=None)
+        # 全非复合 → 免检档直接合并
+        self.assertEqual(new_labels.tolist(), [0, 0, 0, 0])
+        self.assertEqual(monitor.get("gate_compound_deferred_pairs", 0), 0)
+
 
 class TestMergeGatedClusters(unittest.TestCase):
     """簇对合并：贪心 union、标签重排、监控计数"""

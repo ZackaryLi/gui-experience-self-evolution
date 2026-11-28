@@ -476,6 +476,15 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
 汇总规则：必须使用 [Core Action] + [抽象或具体的 Target] 拼接。
 排噪规则：绝对不能包含 Attributes 中的任何平台、时间或修饰语信息，确保相同任务在不同平台或时间的表述，汇总出的 Core Intent 完全一致。
 
+- Compound Detection（复合任务识别，防意图塌缩）：
+判断该指令是否包含**两个及以上需要顺序完成的子任务**（如"打卡后切账号再打卡"是复合任务；"打开淘宝签到"是单任务）。
+规则：
+1. **该拆就拆，别硬压**：复合指令必须标记 is_compound=true，并按执行顺序在 sub_intents 中列出每个子任务（子任务用与 Core Intent 同口径的标准化短语，顺序必须与指令中的执行顺序一致）；
+2. 仅仅是同一个任务的多个参数、多个修饰条件（如"点一杯大杯少冰的拿铁"）**不是**复合任务，is_compound=false；
+3. 子任务允许重复出现（如"签到→切账号→签到"中签到出现两次）；
+4. is_compound=false 时 sub_intents 必须为空数组。
+注意：复合任务的 Core Action / Core Intent 仍按**第一个子任务**汇总（保持与单任务条目的口径可比），复合性完全由 is_compound/sub_intents 承载——下游用这两个字段区分，而非靠猜。
+
 ### 输出格式
 你必须严格输出合法的 JSON 数组 (Array)，包含输入时的 `id` 键值以便映射，不要输出任何解释性文本：
 [
@@ -485,6 +494,8 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
     "specific_target": "string",
     "attributes": ["string", "string"],
     "task_fingerprint": "string",
+    "is_compound": true 或 false,
+    "sub_intents": ["string", ...],
     "core_intent": "string"
   }},
   ...
@@ -497,6 +508,8 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
 [ID: ex_3] 指令: 帮我把名字改成张三。
 [ID: ex_4] 指令: 去淘宝帮我点一下今天的签到。
 [ID: ex_5] 指令: 执行一下每日签到任务。
+[ID: ex_6] 指令: 打开淘宝App，进入成就中心，完成当前账号的今日打卡。打卡完成后，在淘宝中切换到另一个账号，再次进入成就中心完成今日打卡。打卡完成后再切换回原来的账号。
+[ID: ex_7] 指令: 点一杯瑞幸的生椰拿铁，大杯，少冰，不加糖，送到公司。
 
 输出：
 [
@@ -506,6 +519,8 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "specific_target": "指定商品",
         "attributes": ["按销量排序"],
         "task_fingerprint": "在电商搜索结果页中搜索指定商品以浏览目标商品",
+        "is_compound": false,
+        "sub_intents": [],
         "core_intent": "搜索指定商品"
     }},
     {{
@@ -514,6 +529,8 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "specific_target": "个人简介",
         "attributes": ["热爱生活"],
         "task_fingerprint": "在个人资料编辑页中修改个人简介以更新资料信息",
+        "is_compound": false,
+        "sub_intents": [],
         "core_intent": "修改个人简介"
     }},
     {{
@@ -522,6 +539,8 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "specific_target": "昵称",
         "attributes": ["张三"],
         "task_fingerprint": "在个人资料编辑页中修改昵称以更新账号名称",
+        "is_compound": false,
+        "sub_intents": [],
         "core_intent": "修改昵称"
     }},
     {{
@@ -530,6 +549,8 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "specific_target": "签到任务",
         "attributes": ["每日签到"],
         "task_fingerprint": "在会员福利页中执行签到任务以领取奖励",
+        "is_compound": false,
+        "sub_intents": [],
         "core_intent": "执行签到任务"
     }},
     {{
@@ -538,7 +559,29 @@ def build_batch_intent_recognition_prompt(user_commands: t.List[t.Dict[str, str]
         "specific_target": "签到任务",
         "attributes": ["每日签到"],
         "task_fingerprint": "在会员福利页中执行签到任务以领取奖励",
+        "is_compound": false,
+        "sub_intents": [],
         "core_intent": "执行签到任务"
+    }},
+    {{
+        "id": "ex_6",
+        "core_action": "执行",
+        "specific_target": "签到任务",
+        "attributes": ["今日打卡", "成就中心", "多账号切换"],
+        "task_fingerprint": "在成就中心页中循环执行签到任务以完成多账号打卡",
+        "is_compound": true,
+        "sub_intents": ["执行签到任务", "切换账号", "执行签到任务", "切换回原账号"],
+        "core_intent": "执行签到任务"
+    }},
+    {{
+        "id": "ex_7",
+        "core_action": "购买",
+        "specific_target": "指定饮品",
+        "attributes": ["生椰拿铁", "大杯", "少冰", "不加糖", "配送至公司"],
+        "task_fingerprint": "在外卖下单页中购买指定饮品以完成订单提交",
+        "is_compound": false,
+        "sub_intents": [],
+        "core_intent": "购买指定饮品"
     }}
 ]
 
