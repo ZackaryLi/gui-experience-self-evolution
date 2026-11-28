@@ -737,68 +737,7 @@ class TrajectoryRoutingPipeline:
             )
 
             async def _process_and_embed_batch(sub_items: t.List[dict]):
-                batch_inputs = [
-                    {"id": f"item_{idx}", "instruction": item["instruction"]}
-                    for idx, item in enumerate(sub_items)
-                ]
-
-                # 3.1 批量提取分类与意图（带计时与 Token 统计）
-                t_llm_0 = time.perf_counter()
-                res = await self._process_batch_classify_and_intent(batch_inputs, count_usage=self.count_usage)
-                self._add_cum_time("stage1_llm_classify_and_intent_cum", time.perf_counter() - t_llm_0)
-
-                if isinstance(res, tuple):
-                    batch_inputs, batch_usage = res
-                    self._add_usage("stage1_classify_and_intent", batch_usage)
-
-                for idx, item in enumerate(sub_items):
-                    extracted = batch_inputs[idx]
-                    item["intent"] = extracted.get("intent", "")
-                    item["category"] = extracted.get("category", {})
-
-                # 3.2 双用途 Embedding（方案 3.2）：拼接向量 = 聚类主度量，
-                # 分字段向量（target/action）= 门控判据。三种文本段拼成一次
-                # 批量请求编码后按索引段拆分，调用量不变
-                composite_texts, target_texts, action_texts = [], [], []
-                for item in sub_items:
-                    composite_texts.append(build_composite_text(item))
-                    target = str(item.get("target", "") or "").strip()
-                    action = str(item.get("core_action", "") or "").strip()
-                    # 空字段以单空格占位（与 _intent_embedding 的空值防御一致），
-                    # 拆分后长度为 0/空白文本的向量按空值处理，不参与门控
-                    target_texts.append(target if target else " ")
-                    action_texts.append(action if action else " ")
-
-                t_emb_0 = time.perf_counter()
-                merged_texts = composite_texts + target_texts + action_texts
-                merged_embeddings = await self._intent_embedding(merged_texts)
-                self._add_cum_time("stage1_intent_embedding_cum", time.perf_counter() - t_emb_0)
-
-                n = len(sub_items)
-                composite_embs = merged_embeddings[0:n] if len(merged_embeddings) >= n else []
-                target_embs = merged_embeddings[n:2 * n] if len(merged_embeddings) >= 2 * n else []
-                action_embs = merged_embeddings[2 * n:3 * n] if len(merged_embeddings) >= 3 * n else []
-
-                for idx, item in enumerate(sub_items):
-                    comp_emb = composite_embs[idx] if idx < len(composite_embs) else []
-                    item["intent_embedding"] = comp_emb if comp_emb else []
-                    # 分字段向量落盘供 3.3 门控使用；主向量失败的条目分字段向量一并置空
-                    if comp_emb:
-                        t_emb = target_embs[idx] if idx < len(target_embs) else []
-                        a_emb = action_embs[idx] if idx < len(action_embs) else []
-                        item["target_embedding"] = t_emb if t_emb and len(t_emb) == len(comp_emb) else []
-                        item["action_embedding"] = a_emb if a_emb and len(a_emb) == len(comp_emb) else []
-                        if item["target_embedding"] and item["action_embedding"]:
-                            self.embedding_field_stats["structured_items"] += 1
-                        else:
-                            self.embedding_field_stats["field_missing_items"] += 1
-                    else:
-                        # embedding 失败的条目不产出任何向量（包括占位空列表），
-                        # 下次运行缓存未命中可自动重试（S1-P0 的防污染语义）
-                        item["target_embedding"] = []
-                        item["action_embedding"] = []
-                        self.embedding_field_stats["embedding_failed_items"] += 1
-
+                await self._extract_and_embed_items(sub_items)
                 # 3.3 将处理完毕的整个 Batch 放入队列
                 await intent_write_queue.put(sub_items)
 
@@ -818,6 +757,90 @@ class TrajectoryRoutingPipeline:
             self.log(f"增量计算与队列落盘完成，当前全局缓存总条目数: {len(global_cache)}")
 
         return global_cache
+
+    async def _extract_and_embed_items(self, sub_items: t.List[dict]):
+        """对一批唯一指令执行 LLM 提取 + 双用途 Embedding，就地更新 sub_items。
+
+        从 _build_or_load_global_intent_cache 的闭包中提取为实例方法，
+        使真实处理路径可直接被单元测试驱动（此前的闭包结构导致测试
+        只能复刻"预期行为"，无法回归真实链路——曾因此漏掉回写缺字段的 bug）。
+        """
+        batch_inputs = [
+            {"id": f"item_{idx}", "instruction": item["instruction"]}
+            for idx, item in enumerate(sub_items)
+        ]
+
+        # 1. 批量提取分类与意图（带计时与 Token 统计）
+        t_llm_0 = time.perf_counter()
+        res = await self._process_batch_classify_and_intent(batch_inputs, count_usage=self.count_usage)
+        self._add_cum_time("stage1_llm_classify_and_intent_cum", time.perf_counter() - t_llm_0)
+
+        if isinstance(res, tuple):
+            batch_inputs, batch_usage = res
+            self._add_usage("stage1_classify_and_intent", batch_usage)
+
+        # 2. 回写全部提取字段到缓存条目。【修复】旧回写循环只拷 intent/category，
+        # core_action/target/attributes/task_fingerprint 留在 batch_inputs 里
+        # 从未落到 sub_items——导致缓存条目缺结构化字段、拼接向量退化为
+        # embed 旧的 intent 文本、分字段向量全部变成空格占位符的 embedding。
+        for idx, item in enumerate(sub_items):
+            extracted = batch_inputs[idx]
+            item["intent"] = extracted.get("intent", "")
+            item["category"] = extracted.get("category", {})
+            item["core_action"] = extracted.get("core_action", "")
+            item["target"] = extracted.get("target", "")
+            item["attributes"] = extracted.get("attributes", [])
+            item["task_fingerprint"] = extracted.get("task_fingerprint", "")
+
+        # 3. 双用途 Embedding（方案 3.2）：拼接向量 = 聚类主度量，
+        # 分字段向量（target/action）= 门控判据。三种文本段拼成一次
+        # 批量请求编码后按索引段拆分，调用量不变
+        composite_texts, target_texts, action_texts = [], [], []
+        for item in sub_items:
+            composite_texts.append(build_composite_text(item))
+            target = str(item.get("target", "") or "").strip()
+            action = str(item.get("core_action", "") or "").strip()
+            # 空字段以单空格占位（与 _intent_embedding 的空值防御一致），
+            # 拆分后长度为 0/空白文本的向量按空值处理，不参与门控
+            target_texts.append(target if target else " ")
+            action_texts.append(action if action else " ")
+
+        t_emb_0 = time.perf_counter()
+        merged_texts = composite_texts + target_texts + action_texts
+        merged_embeddings = await self._intent_embedding(merged_texts)
+        self._add_cum_time("stage1_intent_embedding_cum", time.perf_counter() - t_emb_0)
+
+        n = len(sub_items)
+        composite_embs = merged_embeddings[0:n] if len(merged_embeddings) >= n else []
+        target_embs = merged_embeddings[n:2 * n] if len(merged_embeddings) >= 2 * n else []
+        action_embs = merged_embeddings[2 * n:3 * n] if len(merged_embeddings) >= 3 * n else []
+
+        for idx, item in enumerate(sub_items):
+            comp_emb = composite_embs[idx] if idx < len(composite_embs) else []
+            item["intent_embedding"] = comp_emb if comp_emb else []
+            # 分字段向量落盘供 3.3 门控使用；主向量失败的条目分字段向量一并置空
+            if comp_emb:
+                t_emb = target_embs[idx] if idx < len(target_embs) else []
+                a_emb = action_embs[idx] if idx < len(action_embs) else []
+                # 空字段文本（" "占位）的向量不可信：空格向量之间相似度恒为 1.0，
+                # 两个都缺字段的条目会让门控空转通过——必须置空表示"不参与门控"
+                # （方案 3.2 空值处理：target 为空的指令归噪声集，由 LLM 裁决兜底）
+                item["target_embedding"] = (
+                    t_emb if target_texts[idx].strip() and t_emb and len(t_emb) == len(comp_emb) else []
+                )
+                item["action_embedding"] = (
+                    a_emb if action_texts[idx].strip() and a_emb and len(a_emb) == len(comp_emb) else []
+                )
+                if item["target_embedding"] and item["action_embedding"]:
+                    self.embedding_field_stats["structured_items"] += 1
+                else:
+                    self.embedding_field_stats["field_missing_items"] += 1
+            else:
+                # embedding 失败的条目不产出任何向量（包括占位空列表），
+                # 下次运行缓存未命中可自动重试（S1-P0 的防污染语义）
+                item["target_embedding"] = []
+                item["action_embedding"] = []
+                self.embedding_field_stats["embedding_failed_items"] += 1
 
     async def _run_global_clustering_on_cache(
             self,

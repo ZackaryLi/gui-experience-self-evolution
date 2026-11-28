@@ -32,20 +32,24 @@ def _fake_vec(seed: float, dim: int = 8):
 class _FakeLLM:
     """假 LLM：意图提取返回带结构化字段的批量 JSON"""
 
-    async def ainvoke(self, prompt, count_usage=False):
-        if "Core Action" in prompt:
-            return json.dumps([
-                {"id": "traj_0", "core_action": "修改", "target": "昵称",
-                 "attributes": ["张三"], "task_fingerprint": "在个人资料编辑页中修改昵称",
-                 "core_intent": "修改昵称"},
-                {"id": "traj_1", "core_action": "签到", "target": "签到任务",
-                 "attributes": [], "task_fingerprint": "在会员福利页中执行签到任务",
-                 "core_intent": "执行签到任务"},
-            ], ensure_ascii=False)
-        return json.dumps([
+    def __init__(self):
+        self.intent_response = json.dumps([
+            {"id": "traj_0", "core_action": "修改", "target": "昵称",
+             "attributes": ["张三"], "task_fingerprint": "在个人资料编辑页中修改昵称以更新账号名称",
+             "core_intent": "修改昵称"},
+            {"id": "traj_1", "core_action": "签到", "target": "签到任务",
+             "attributes": [], "task_fingerprint": "在会员福利页中执行签到任务以领取奖励",
+             "core_intent": "执行签到任务"},
+        ], ensure_ascii=False)
+        self.category_response = json.dumps([
             {"id": "traj_0", "category": "应用设置配置"},
             {"id": "traj_1", "category": "签到"},
         ], ensure_ascii=False)
+
+    async def ainvoke(self, prompt, count_usage=False):
+        if "Core Action" in prompt:
+            return self.intent_response
+        return self.category_response
 
 
 class _FakeEmbedding:
@@ -148,10 +152,15 @@ class TestCompositeEmbedding(unittest.TestCase):
         item = {"core_action": "修改", "target": "昵称", "attributes": "非法"}
         self.assertEqual(fn(item), "修改 昵称")
 
-    # ---------- 双用途 embedding 拆段与落盘 ----------
+    # ---------- 双用途 embedding 拆段与落盘（驱动真实方法 _extract_and_embed_items） ----------
 
-    def test_dual_embedding_segments_and_fields(self):
-        """三段文本一次请求编码后按索引拆段，分字段向量正确落盘"""
+    def test_extract_and_embed_items_full_pipeline(self):
+        """回归测试（真实路径）：提取字段全量回写 + 三段拆段无错位。
+
+        此前的测试复刻"预期行为"而未走真实闭包，曾漏掉回写循环只拷
+        intent/category、结构化字段从未落缓存条目的 bug——真机跑出
+        global_instruction_cache 只有 intent 字段即由此而来。
+        """
         p = self._make_pipeline()
         fake_embed = _FakeEmbedding()
 
@@ -160,54 +169,62 @@ class TestCompositeEmbedding(unittest.TestCase):
 
         p._intent_embedding = _fake_intent_embedding
 
-        # 直接调用 _build_or_load_global_intent_cache 太重（writer 协程等），
-        # 复用其核心 batch 处理逻辑：这里手工驱动等价闭包不可行，改为验证
-        # 逻辑的可测核心——拆段函数行为通过实际执行 pipeline 的批处理入口。
-        # 简化策略：构造 items 后直接执行与闭包一致的代码路径。
         items = [
             {"cache_key": "k0", "app": "微信", "instruction": "帮我改一下昵称"},
             {"cache_key": "k1", "app": "淘宝", "instruction": "去签到"},
         ]
-        batch_inputs = [{"id": f"item_{i}", "instruction": it["instruction"]}
-                        for i, it in enumerate(items)]
+        asyncio.run(p._extract_and_embed_items(items))
 
-        async def _run():
-            # 与 _process_and_embed_batch 相同的三段构造
-            composite_texts, target_texts, action_texts = [], [], []
-            for it in items:
-                # 模拟 LLM 提取结果已写回
-                pass
-            await p._process_batch_classify_and_intent(batch_inputs, count_usage=False)
-            for i, it in enumerate(items):
-                it.update({
-                    "intent": batch_inputs[i].get("intent", ""),
-                    "core_action": batch_inputs[i].get("core_action", ""),
-                    "target": batch_inputs[i].get("target", ""),
-                    "attributes": batch_inputs[i].get("attributes", []),
-                })
-                composite_texts.append(self.pipeline_mod.build_composite_text(it))
-                target_texts.append(it["target"] if it["target"] else " ")
-                action_texts.append(it["core_action"] if it["core_action"] else " ")
-            merged = await p._intent_embedding(composite_texts + target_texts + action_texts)
-            n = len(items)
-            return items, merged[0:n], merged[n:2 * n], merged[2 * n:3 * n], fake_embed.inputs_seen
+        # 【核心回归】结构化字段必须落在缓存条目上（bug 的直接症状）
+        nickname = items[0]
+        self.assertEqual(nickname["intent"], "修改昵称")
+        self.assertEqual(nickname["core_action"], "修改")
+        self.assertEqual(nickname["target"], "昵称")
+        self.assertEqual(nickname["attributes"], ["张三"])
+        self.assertEqual(nickname["task_fingerprint"], "在个人资料编辑页中修改昵称以更新账号名称")
+        self.assertEqual(nickname["category"]["category"], "应用设置配置")
 
-        items, comp, tgt, act, inputs_seen = asyncio.run(_run())
+        # 一次请求包含三段拼接的完整文本，拼接段使用结构化字段而非回退 intent
+        self.assertEqual(len(fake_embed.inputs_seen), 1)
+        self.assertEqual(len(fake_embed.inputs_seen[0]), 6)  # 2 条 × 3 段
+        self.assertEqual(fake_embed.inputs_seen[0][0], "修改 昵称 张三")
+        self.assertEqual(fake_embed.inputs_seen[0][2], "昵称")   # target 段非空格占位
+        self.assertEqual(fake_embed.inputs_seen[0][4], "修改")   # action 段非空格占位
 
-        # 一次请求包含三段拼接的完整文本
-        self.assertEqual(len(inputs_seen), 1)
-        self.assertEqual(len(inputs_seen[0]), 6)  # 2 条 × 3 段
-        # 拆段正确：composite 段在前
-        self.assertEqual(inputs_seen[0][0], "修改 昵称 张三")
-        self.assertEqual(inputs_seen[0][2], "昵称")  # target 段
-        self.assertEqual(inputs_seen[0][4], "修改")  # action 段
-        # 向量非空且与拆段顺序一致（不同文本得到不同向量）
-        self.assertTrue(all(v for v in comp))
-        self.assertTrue(all(v for v in tgt))
-        self.assertTrue(all(v for v in act))
+        # 三路向量全部落盘且非空
+        for it in items:
+            self.assertTrue(it["intent_embedding"])
+            self.assertTrue(it["target_embedding"])
+            self.assertTrue(it["action_embedding"])
+        # 监控计数：两条均为结构化齐全
+        self.assertEqual(p.embedding_field_stats["structured_items"], 2)
 
-    def test_dual_embedding_failure_all_empty(self):
-        """embedding 整体失败时每个输入文本都得到空占位（供上层将全部字段置空）"""
+    def test_extract_and_embed_items_fallback_for_missing_fields(self):
+        """LLM 未输出结构化字段（提取失败/漏字段）时：回退 intent 文本，
+        分字段段用空格占位，向量按空值处理不参与门控"""
+        fake_llm = _FakeLLM()
+        fake_llm.intent_response = json.dumps([
+            {"id": "traj_0", "core_intent": "只有汇总短语"}
+        ], ensure_ascii=False)
+        p = self._make_pipeline()
+        p.llm = fake_llm
+
+        async def _fake_intent_embedding(texts, model="bge-m3"):
+            return [[0.5] * 8 for _ in texts]
+
+        p._intent_embedding = _fake_intent_embedding
+
+        items = [{"cache_key": "k0", "app": "抖音", "instruction": "签到"}]
+        asyncio.run(p._extract_and_embed_items(items))
+
+        self.assertEqual(items[0]["intent"], "只有汇总短语")
+        self.assertEqual(items[0]["core_action"], "")
+        self.assertEqual(items[0]["target"], "")
+        # 主向量成功但分字段缺失 → field_missing 计数
+        self.assertEqual(p.embedding_field_stats["field_missing_items"], 1)
+
+    def test_extract_and_embed_items_embedding_failure(self):
+        """embedding 整体失败：三路向量全部置空，计入 failed 计数（下次运行重试）"""
         p = self._make_pipeline()
         fake_embed = _FakeEmbedding(fail_all=True)
 
@@ -215,10 +232,14 @@ class TestCompositeEmbedding(unittest.TestCase):
             return await fake_embed.call(texts)
 
         p._intent_embedding = _fake_intent_embedding
-        merged = asyncio.run(p._intent_embedding(["测试文本", " ", " "]))
-        # 失败时返回与输入等长的空列表占位（与线上 _intent_embedding 的防越界口径一致）
-        self.assertEqual(merged, [[], [], []])
-        self.assertTrue(all(not v for v in merged))
+
+        items = [{"cache_key": "k0", "app": "微信", "instruction": "帮我改一下昵称"}]
+        asyncio.run(p._extract_and_embed_items(items))
+
+        self.assertEqual(items[0]["intent_embedding"], [])
+        self.assertEqual(items[0]["target_embedding"], [])
+        self.assertEqual(items[0]["action_embedding"], [])
+        self.assertEqual(p.embedding_field_stats["embedding_failed_items"], 1)
 
 
 if __name__ == "__main__":
