@@ -28,7 +28,8 @@ from .plan_recall import query_plan
 from .llm import extract_json, LLMAgent
 from .instruction_pattern_recognition import (
     build_intent_summary_prompt,
-    build_batch_scenario_classify_prompt, build_batch_intent_recognition_prompt
+    build_batch_scenario_classify_prompt, build_batch_intent_recognition_prompt,
+    build_cluster_merge_verdict_prompt
 )
 from .verdict import build_trajectory_text, build_batch_verdict_prompt, resolve_task_completed, get_sorted_steps
 from .intent_gating import BandedGatingConfig, gate_cluster_pair, merge_gated_clusters
@@ -1074,67 +1075,182 @@ class TrajectoryRoutingPipeline:
 
         self._set_wall_time("stage1_2_cluster_llm_naming", time.perf_counter() - t_naming_start)
 
-        # 5. 后置同义簇合并（【耗时统计】子计时 3：同义簇合并开始）
+        # 5. LLM 簇合并裁决（方案 3.4，替换旧的"簇名 embedding 相似度 ≥0.85 一刀切合并"）
+        # 旧机制两层致命：① 在"摘要的摘要"（簇名）上做合并判定，名字相似 ≠ 任务相同；
+        # ② 合并不可逆且被缓存固化。新机制给 LLM 看两簇各自采样的原始 instruction，
+        # 判定口径直接对齐下游"一簇一条经验"：能否用同一条固定执行方案完成。
         t_merge_start = time.perf_counter()
         global_cluster_id_map = defaultdict(lambda: defaultdict(dict))
-        embed_batch_size = 64
 
-        for scenario, apps in summary_dict.items():
-            for app, c_name_map in apps.items():
-                c_ids = list(c_name_map.keys())
+        # 5.1 裁决缓存：跨运行复用已裁决的簇对结论（幂等键 = 簇成员指令指纹）
+        verdict_cache_path = self.save_path / "cluster_merge_verdicts.jsonl"
+        verdict_cache: t.Dict[str, dict] = {}
+        if verdict_cache_path.exists():
+            try:
+                with open(verdict_cache_path, "r", encoding="utf-8") as f_vc:
+                    for line in f_vc:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if obj.get("verdict_key") and isinstance(obj.get("can_merge"), bool):
+                                verdict_cache[obj["verdict_key"]] = obj
+                        except json.JSONDecodeError:
+                            continue
+                if verdict_cache:
+                    self.log(f"✅ 载入历史簇合并裁决缓存: {len(verdict_cache)} 条")
+            except Exception as e:
+                self.log(f"[簇合并裁决缓存加载异常] {e}")
+
+        # 5.2 构建候选簇对：同桶内簇中心相似度落在候选带的才需要裁决
+        # （免检对已在门控阶段直接合并；过远对不必裁决——与方案 3.4 候选带一致）
+        candidate_band_low, candidate_band_high = 0.75, 0.88
+        merge_verdict_tasks = []
+        for scenario, apps in grouped_data.items():
+            for app, items in apps.items():
+                cluster_groups = defaultdict(list)
+                for it in items:
+                    c_id = it['item'].get('cluster_label', -1)
+                    if c_id != -1 and it['success']:
+                        cluster_groups[c_id].append(it)
+
+                c_ids = sorted(cluster_groups.keys())
                 for cid in c_ids:
                     global_cluster_id_map[scenario][app][cid] = cid
-
                 if len(c_ids) < 2:
                     continue
 
-                names = [c_name_map[cid] for cid in c_ids]
-                try:
-                    raw_embeddings_list = []
-                    for start_idx in range(0, len(names), embed_batch_size):
-                        batch_names = names[start_idx: start_idx + embed_batch_size]
-                        batch_embs = await self._intent_embedding(batch_names)
-                        raw_embeddings_list.extend(batch_embs)
+                # 簇中心向量（基于 global_X 归一化主度量）
+                def _center_of(cid):
+                    idxs = [it['global_index'] for it in cluster_groups[cid]]
+                    c = global_X[idxs].mean(axis=0)
+                    n = np.linalg.norm(c)
+                    return c / n if n > 0 else c
 
-                    if (
-                            len(raw_embeddings_list) != len(names)
-                            or any(not emb or len(emb) != vector_dim for emb in raw_embeddings_list)
-                    ):
-                        self.log(f"[同义簇合并跳过] {scenario}-{app} 部分名称 Embedding 失败或维度不一致")
-                        continue
+                centers = {cid: _center_of(cid) for cid in c_ids}
+                for x in range(len(c_ids)):
+                    for y in range(x + 1, len(c_ids)):
+                        ca, cb = centers[c_ids[x]], centers[c_ids[y]]
+                        denom = float(np.linalg.norm(ca) * np.linalg.norm(cb))
+                        sim = float(np.dot(ca, cb) / denom) if denom > 0 else 0.0
+                        if candidate_band_low <= sim <= candidate_band_high:
+                            merge_verdict_tasks.append((scenario, app, c_ids[x], c_ids[y],
+                                                        cluster_groups[c_ids[x]], cluster_groups[c_ids[y]], sim))
 
-                    name_embeddings = np.asarray(raw_embeddings_list, dtype=np.float32)
-                    name_norms = np.linalg.norm(name_embeddings, axis=1, keepdims=True)
-                    name_norms[name_norms == 0] = 1.0
-                    normed_name_embs = name_embeddings / name_norms
-                    sim_matrix = normed_name_embs @ normed_name_embs.T
-                except Exception as e:
-                    self.log(f"[同义簇合并异常] {scenario}-{app}: {e}")
-                    continue
+        self.log(f"共 {len(merge_verdict_tasks)} 个候选簇对进入 LLM 合并裁决（候选带 [{candidate_band_low}, {candidate_band_high}]）")
 
-                cluster_sizes = defaultdict(int)
-                for it in grouped_data[scenario][app]:
-                    c_lbl = it['item'].get('cluster_label', -1)
-                    if c_lbl != -1:
-                        cluster_sizes[c_lbl] += 1
+        # 5.3 逐对裁决（带缓存命中与一次重试；LLM 失败的对保持分裂，宁分不合）
+        merge_failed_keys = []
+        verdict_records = []
 
-                sorted_idx = sorted(range(len(c_ids)), key=lambda idx: cluster_sizes[c_ids[idx]], reverse=True)
+        def _pair_fingerprint(cluster_a_items, cluster_b_items) -> str:
+            """幂等键：两簇成员指令的 MD5（排序去重后拼接），簇成员不变则结论可复用"""
+            texts_a = sorted({it['item'].get('instruction', '') for it in cluster_a_items})
+            texts_b = sorted({it['item'].get('instruction', '') for it in cluster_b_items})
+            combined = "|".join(texts_a) + "##" + "|".join(texts_b)
+            return hashlib.md5(combined.encode('utf-8')).hexdigest()
 
-                processed = set()
-                for i in sorted_idx:
-                    if i in processed:
-                        continue
-                    main_c_id = c_ids[i]
-                    main_name = c_name_map[main_c_id]
-                    processed.add(i)
+        def _sample_instructions(cluster_items, k=8) -> t.List[str]:
+            """采样最多 k 条非空原始指令作为裁决输入"""
+            texts = [it['item'].get('instruction', '') for it in cluster_items
+                     if it['item'].get('instruction')]
+            if len(texts) <= k:
+                return texts
+            step = len(texts) / k
+            return [texts[min(len(texts) - 1, int(i * step))] for i in range(k)]
 
-                    sim_indices = np.where(sim_matrix[i] >= 0.85)[0]
-                    for j in sim_indices:
-                        if j not in processed:
-                            sub_c_id = c_ids[j]
-                            c_name_map[sub_c_id] = main_name
-                            global_cluster_id_map[scenario][app][sub_c_id] = main_c_id
-                            processed.add(j)
+        async def _run_verdict(scenario, app, cid_a, cid_b, items_a, items_b, sim):
+            key = _pair_fingerprint(items_a, items_b)
+            if key in verdict_cache:
+                return key, verdict_cache[key], True
+
+            prompt = build_cluster_merge_verdict_prompt(
+                _sample_instructions(items_a), _sample_instructions(items_b))
+            res = await self.llm.ainvoke(prompt, temperature=0.0, count_usage=self.count_usage)
+            if isinstance(res, tuple):
+                res, usage = res
+                self._add_usage("stage1_cluster_naming", usage)
+
+            # 基础设施失败重试一次；仍失败返回 None（调用方记录失败、保持分裂）
+            if res is None:
+                res = await self.llm.ainvoke(prompt, temperature=0.0, count_usage=self.count_usage)
+                if isinstance(res, tuple):
+                    res, usage = res
+                    self._add_usage("stage1_cluster_naming", usage)
+
+            if res is None:
+                return key, None, False
+
+            record = extract_json(res)
+            if not isinstance(record, dict) or not isinstance(record.get("can_merge"), bool):
+                return key, None, False
+            record = {
+                "verdict_key": key,
+                "scenario": scenario, "app": app,
+                "cluster_a": cid_a, "cluster_b": cid_b,
+                "center_sim": round(sim, 6),
+                "can_merge": record["can_merge"],
+                "reason": str(record.get("reason", "")),
+                "boundary_case": str(record.get("boundary_case", "")),
+            }
+            return key, record, True
+
+        with tqdm(total=len(merge_verdict_tasks), desc="簇合并 LLM 裁决", unit="pair") as pbar:
+            async def _tracked(pair):
+                r = await _run_verdict(*pair)
+                pbar.update(1)
+                return r
+            results = await asyncio.gather(*[_tracked(p) for p in merge_verdict_tasks])
+
+        # 5.4 应用裁决：union-find 合并 can_merge=true 的簇对（相似度降序贪心，
+        # 已合并 root 不重复参与），裁决记录追加落盘（幂等键去重，可审计可回滚）
+        root: t.Dict[tuple, tuple] = {}
+
+        def find(x: tuple) -> tuple:
+            while root[x] != x:
+                root[x] = root[root[x]]
+                x = root[x]
+            return x
+
+        all_cluster_keys = {(s, a, cid) for s, apps in grouped_data.items()
+                            for a, its in apps.items() for it in its
+                            for cid in [it['item'].get('cluster_label', -1)] if cid != -1}
+        for k in all_cluster_keys:
+            root[k] = k
+
+        new_cache_lines = []
+        for (key, record, ok) in results:
+            if not ok or record is None:
+                # 裁决失败（LLM/解析）：不缓存、不合并，下次运行重试
+                merge_failed_keys.append(key)
+                continue
+            verdict_records.append(record)
+            new_cache_lines.append(json.dumps(record, ensure_ascii=False) + "\n")
+            if record["can_merge"]:
+                ka = (record["scenario"], record["app"], record["cluster_a"])
+                kb = (record["scenario"], record["app"], record["cluster_b"])
+                ra, rb = find(ka), find(kb)
+                if ra != rb:
+                    root[rb] = ra
+
+        if new_cache_lines:
+            try:
+                with open(verdict_cache_path, "a", encoding="utf-8") as f_vc:
+                    f_vc.writelines(new_cache_lines)
+                    f_vc.flush()
+            except Exception as e:
+                self.log(f"[簇合并裁决缓存写入失败] {e}")
+
+        # 展平 union-find → 场景/app/cid 的映射表（供第 6 步回写）
+        for k in all_cluster_keys:
+            r = find(k)
+            if r != k:
+                global_cluster_id_map[k[0]][k[1]][k[2]] = r[2]
+
+        merged_count = sum(1 for k in all_cluster_keys if find(k) != k)
+        self.log(f"簇合并裁决完成：裁决 {len(verdict_records)} 对 / 合并 {merged_count} 个簇成员 / "
+                 f"失败待重试 {len(merge_failed_keys)} 对（保持分裂）")
 
         self._set_wall_time("stage1_2_synonym_cluster_merge", time.perf_counter() - t_merge_start)
 

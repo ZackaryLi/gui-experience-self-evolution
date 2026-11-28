@@ -582,3 +582,44 @@ def build_intent_summary_prompt(intents_str: str):
 # 输入样本：
 {intents_str}
 """
+
+
+def build_cluster_merge_verdict_prompt(
+        instructions_a: t.List[str],
+        instructions_b: t.List[str],
+) -> str:
+    """
+    构建 LLM 簇合并裁决 Prompt（方案 3.4）。
+
+    输入为两个簇各自采样的**原始 instruction**（不是簇名、不是抽象 intent），
+    判定口径与下游"一簇一条经验"直接对齐：能否用同一条固定执行方案完成。
+    """
+    str_a = "\n".join(f"- {x}" for x in instructions_a)
+    str_b = "\n".join(f"- {x}" for x in instructions_b)
+    return f"""
+你是手机 GUI Agent 的任务等价性判定专家。以下是聚类系统中两个候选簇的
+用户原始指令采样。
+
+# 判定问题
+这两个簇里的任务，能否用**同一条固定的执行步骤方案**完成？
+
+# 判定标准
+1. **同一任务**：所有指令的操作路径一致（进入相同页面、点击相同类型的入口、
+   走相同的交互链路），仅表述、平台、具体参数（商品名、联系人名等）不同
+   ——可以为它们生成一条共用经验方案，判 can_merge=true；
+2. **不同任务**：只要存在指令需要进入不同的页面、点击不同的入口、
+   或需要显著不同的操作步骤（如"修改昵称"与"修改个性签名"入口不同），
+   就不能共用一条方案，判 can_merge=false；
+3. 拿不准时一律判 false（错合会让经验方案对部分任务必然错误，
+   错分只是数据摊薄，代价更小）。
+
+# 簇 A 的指令样本：
+{str_a}
+
+# 簇 B 的指令样本：
+{str_b}
+
+# 输出要求
+只输出合法 JSON（不要 markdown 标记、不要解释文字）：
+{{"can_merge": true 或 false, "reason": "判定理由，限40字", "boundary_case": "若判 false，指出是哪组指令与其他指令路径不同，限30字，判 true 则为空字符串"}}
+"""
