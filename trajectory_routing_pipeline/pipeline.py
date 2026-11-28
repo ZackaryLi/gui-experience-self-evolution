@@ -31,6 +31,7 @@ from .instruction_pattern_recognition import (
     build_batch_scenario_classify_prompt, build_batch_intent_recognition_prompt
 )
 from .verdict import build_trajectory_text, build_batch_verdict_prompt, resolve_task_completed, get_sorted_steps
+from .intent_gating import BandedGatingConfig, gate_cluster_pair, merge_gated_clusters
 
 LOG_FILE = "run.log"
 MAX_LLM_CONCURRENCY = 6
@@ -163,11 +164,14 @@ def _process_cluster_worker(local_X: np.ndarray, need_coords: bool = False):
         # 所有样本的向量完全一致，直接全部归为第 0 簇
         labels = np.zeros(n_samples, dtype=int)
     else:
+        # 过分割阈值（方案 3.3）：从 0.22 收紧至 0.13（相似度 ≥0.87 才直接成簇），
+        # 保守预分组由门控 + LLM 裁决在高置信时合并回来——宁可错分，不可错合。
+        # 待 clustering_purity_bench 的 calibration 报告校准后修正此值
         clustering = AgglomerativeClustering(
             n_clusters=None,
             metric='cosine',
             linkage='complete',
-            distance_threshold=0.22
+            distance_threshold=0.13
         )
         unique_labels = clustering.fit_predict(unique_X)
         # 将唯一向量的聚类标签映射回全量样本
@@ -254,6 +258,8 @@ class TrajectoryRoutingPipeline:
         self.embedding_sem = asyncio.Semaphore(max_embedding_concurrency)
 
         self.count_usage = count_usage
+        # 带宽式门控配置（方案 3.3）：阈值占位默认值，待 calibration 报告校准后修正
+        self.gating_config = BandedGatingConfig()
         # 双用途表征监控（方案 3.2）：结构化字段产出率 / embedding 失败数，
         # 与 perf_stats 同批刷盘，供观测新表征落地质量
         self.embedding_field_stats = {
@@ -885,18 +891,35 @@ class TrajectoryRoutingPipeline:
         global_X = np.zeros((n_samples, vector_dim), dtype=np.float32)
         vector_success_map = np.zeros(n_samples, dtype=bool)
 
-        for i, item in enumerate(items_list):
-            emb = item.pop('intent_embedding', None)
-            if emb and isinstance(emb, list) and len(emb) == vector_dim:
-                vec = np.asarray(emb, dtype=np.float32)
+        # 分字段向量矩阵（方案 3.3 门控判据）：与主向量同维度校验，L2 归一化
+        target_X = np.zeros((n_samples, vector_dim), dtype=np.float32)
+        action_X = np.zeros((n_samples, vector_dim), dtype=np.float32)
+        field_vector_map = np.zeros(n_samples, dtype=bool)
+
+        def _norm_vec(emb_list) -> np.ndarray | None:
+            if emb_list and isinstance(emb_list, list) and len(emb_list) == vector_dim:
+                vec = np.asarray(emb_list, dtype=np.float32)
                 norm = np.linalg.norm(vec)
                 if norm > 1e-9 and not np.isnan(norm):
-                    global_X[i] = vec / norm
-                    vector_success_map[i] = True
-                else:
-                    vector_success_map[i] = False
+                    return vec / norm
+            return None
+
+        for i, item in enumerate(items_list):
+            emb = item.pop('intent_embedding', None)
+            normed = _norm_vec(emb)
+            if normed is not None:
+                global_X[i] = normed
+                vector_success_map[i] = True
             else:
                 vector_success_map[i] = False
+
+            # 分字段向量：缺字段（旧缓存条目）时置失败位，灰度带内宁分不合
+            t_vec = _norm_vec(item.pop('target_embedding', None))
+            a_vec = _norm_vec(item.pop('action_embedding', None))
+            if t_vec is not None and a_vec is not None:
+                target_X[i] = t_vec
+                action_X[i] = a_vec
+                field_vector_map[i] = True
 
         # 2. 按场景 (category) 和 app 分桶
         grouped_data = defaultdict(lambda: defaultdict(list))
@@ -911,10 +934,14 @@ class TrajectoryRoutingPipeline:
             })
 
         # 3. 局部层次聚类（【耗时统计】子计时 1：CPU 层次聚类开始）
+        # 过分割阈值（方案 3.3）：从 0.22 收紧（相似度 0.78 → 0.87 量级），
+        # 先保守分组，簇对层的带宽式门控再做高置信合并——宁可错分，不可错合
         t_cpu_start = time.perf_counter()
         loop = asyncio.get_running_loop()
         cluster_futures = []
         cluster_meta = []
+        gate_config = getattr(self, "gating_config", None) or BandedGatingConfig()
+        gate_monitor_total = {}
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as thread_pool:
             for scenario, apps in grouped_data.items():
@@ -944,10 +971,33 @@ class TrajectoryRoutingPipeline:
                 self.log(f"正在并发执行 {len(cluster_futures)} 个 (场景-App) 分桶的层次聚类...")
                 cluster_results = await asyncio.gather(*cluster_futures)
                 for valid_items, (labels, _) in zip(cluster_meta, cluster_results):
-                    for it, label in zip(valid_items, labels):
+                    labels = np.asarray(labels)
+                    # 门控驱动的簇对合并（方案 3.3(c) 两步近似：聚类先过分割，
+                    # 门控在簇对层做高置信合并；分字段向量按 global_index 取对齐行）
+                    g_indices = [it['global_index'] for it in valid_items]
+                    local_target = target_X[g_indices]
+                    local_action = action_X[g_indices]
+                    # 任一成员缺分字段向量时该桶门控退化为宁分不合（保持过分割现状）
+                    local_field_ok = bool(np.all(field_vector_map[g_indices]))
+                    local_target_in = local_target if local_field_ok else None
+                    local_action_in = local_action if local_field_ok else None
+
+                    new_labels, decisions = merge_gated_clusters(
+                        gate_config, labels, local_X,
+                        local_target_in, local_action_in,
+                        cluster_monitor=gate_monitor_total,
+                    )
+                    if decisions:
+                        merged_pairs = sum(1 for d in decisions if d["merge"])
+                        self.log(f"门控合并：桶内 {len(set(labels.tolist()))} 簇 → "
+                                 f"{len(set(new_labels[new_labels != -1].tolist()))} 簇，"
+                                 f"执行合并 {merged_pairs} 对")
+                    for it, label in zip(valid_items, new_labels):
                         it['item']['cluster_label'] = int(label)
 
         self._set_wall_time("stage1_2_local_clustering_cpu", time.perf_counter() - t_cpu_start)
+        # 门控指标进 perf 报告（方案第五章监控项）
+        self.perf_stats.setdefault("gate_stats", {}).update(gate_monitor_total)
 
         # 4. LLM 聚类簇命名总结（【耗时统计】子计时 2：LLM 命名开始）
         t_naming_start = time.perf_counter()
